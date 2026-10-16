@@ -1,11 +1,11 @@
 #!/bin/sh
 set -e
-SRC=vendor/luau
+SRC=third_party/luau
 DST=luau/core
 
 mkdir -p $DST
 rm -f $DST/*.cpp $DST/*.h
-# removes the old flat layout; harmless once it's gone
+
 find luau -maxdepth 1 \( -name '*.cpp' -o -name '*.h' \) ! -name 'bridge.*' -delete
 rm -rf luau/include && mkdir -p luau/include
 

@@ -1,3 +1,3 @@
 module github.com/Leoj030/go-luau
 
-go 1.27.1
+go 1.21
