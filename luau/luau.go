@@ -13,6 +13,8 @@ import (
 	"errors"
 	"unsafe"
 	"runtime/cgo"
+	"context"
+	"sync"
 
 	_ "github.com/Leoj030/go-luau/luau/core"
 )
@@ -32,15 +34,129 @@ type State struct {
 	names  []*C.char // debug names; Luau keeps these pointers, so they live until Close
 }
 
-func NewState() (*State, error) {
+// Selects standard libraries for NewStateWith.
+type Lib uint32
+
+const (
+	LibBase      Lib = C.BRIDGE_LIB_BASE
+	LibCoroutine Lib = C.BRIDGE_LIB_COROUTINE
+	LibTable     Lib = C.BRIDGE_LIB_TABLE
+	LibOS        Lib = C.BRIDGE_LIB_OS
+	LibString    Lib = C.BRIDGE_LIB_STRING
+	LibBit32     Lib = C.BRIDGE_LIB_BIT32
+	LibBuffer    Lib = C.BRIDGE_LIB_BUFFER
+	LibUTF8      Lib = C.BRIDGE_LIB_UTF8
+	LibClass     Lib = C.BRIDGE_LIB_CLASS
+	LibMath      Lib = C.BRIDGE_LIB_MATH
+	LibDebug     Lib = C.BRIDGE_LIB_DEBUG
+	LibVector    Lib = C.BRIDGE_LIB_VECTOR
+	LibInteger   Lib = C.BRIDGE_LIB_INTEGER
+
+	// LibNone opens no libraries at all, not even the base library.
+	LibNone Lib = C.BRIDGE_LIB_NONE
+
+	// LibDefault is the set a zero-value Options opens: what luaL_openlibs
+	// opens in the vendored Luau version. It leaves out LibClass and
+	// LibInteger, which Luau provides but does not open by default.
+	LibDefault = LibBase | LibCoroutine | LibTable | LibOS | LibString | LibBit32 |
+		LibBuffer | LibUTF8 | LibMath | LibDebug | LibVector
+
+	// LibAll opens every library this binding knows about, including the
+	// ones that are off by default.
+	LibAll = LibDefault | LibClass | LibInteger
+)
+
+// Configures a new State.
+type Options struct {
+	// Picks the standard libraries to open, for example
+	// LibBase|LibMath|LibString|LibTable. The zero value opens Luau's
+	// default set (what luaL_openlibs opens). Use LibNone for no libraries.
+	Libs Lib
+
+	// Caps the memory the state may allocate, in bytes. Going
+	// over it makes the running script fail with ErrMemory. 0 means no limit.
+	MemoryLimit int
+}
+
+var (
+	// Returned (wrapped) when a script was stopped by Interrupt.
+	ErrInterrupted = errors.New("luau: script interrupted")
+	// Returned (wrapped) when a script exceeded the memory limit.
+	ErrMemory = errors.New("luau: memory limit exceeded")
+)
+
+// Creates a state with the default libraries and no memory limit.
+func NewState() (*State, error) { return NewStateWith(Options{}) }
+
+// Creates a state configured by opts.
+func NewStateWith(opts Options) (*State, error) {
+	if opts.MemoryLimit < 0 {
+		return nil, errors.New("luau: MemoryLimit must not be negative")
+	}
+	libs := opts.Libs
+	if libs&LibNone != 0 {
+		libs = LibNone // "none" wins over any other flag
+	}
+
 	s := &State{funcs: map[int]Func{}}
 	s.handle = cgo.NewHandle(s)
-	s.l = C.bridge_newstate(C.uintptr_t(s.handle))
+	s.l = C.bridge_newstate(C.uintptr_t(s.handle), C.uint(libs), C.size_t(opts.MemoryLimit))
 	if s.l == nil {
 		s.handle.Delete()
-		return nil, errors.New("luau: failed to create state")
+		return nil, errors.New("luau: failed to create state (is MemoryLimit too small?)")
 	}
 	return s, nil
+}
+
+// Returns the number of bytes the state currently has allocated.
+func (s *State) MemoryUsed() int { return int(C.bridge_memused(s.l)) }
+
+// Locks the state down for running scripts: library tables and the
+// globals table become read-only, so scripts can no longer modify the
+// standard libraries or assign new globals.
+//
+// Call it after opening libraries and setting up everything your scripts
+// need (SetGlobal, Register, ...). Once sandboxed, those fail too, because
+// the globals table is read-only for you as well.
+func (s *State) Sandbox() { C.bridge_sandbox(s.l) }
+
+// Asks the running script to stop. It is safe to call from any
+// goroutine. The script fails with an error wrapping ErrInterrupted at its
+// next safepoint (a loop iteration or a call), and keeps failing until
+// ClearInterrupt is called. Never call it after Close.
+func (s *State) Interrupt() { C.bridge_interrupt(s.l) }
+
+// Clears a pending interrupt so the state can run again.
+func (s *State) ClearInterrupt() { C.bridge_clearinterrupt(s.l) }
+
+// Interrupts the state when ctx is done. Call the returned
+// function when the script has finished: it stops the watcher, waits for it
+// to exit, and clears any interrupt so the state can be reused. Call it
+// before Close.
+//
+//	stop := L.WatchContext(ctx)
+//	err := L.DoString(src)
+//	stop()
+func (s *State) WatchContext(ctx context.Context) (stop func()) {
+	s.ClearInterrupt()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case <-ctx.Done():
+			s.Interrupt()
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-finished
+			s.ClearInterrupt()
+		})
+	}
 }
 
 func (s *State) Close() {
@@ -81,8 +197,8 @@ func Compile(src string) ([]byte, error) {
 }
 
 // Builds a Go error from the error value on top of the stack,
-// then truncates the stack back to base.
-func (s *State) failWith(base int) error {
+// then truncates the stack back to base. status is the Luau status code.
+func (s *State) failWith(base int, status C.int) error {
 	var n C.size_t
 	msg := ""
 	if p := C.bridge_tostring(s.l, -1, &n); p != nil {
@@ -91,6 +207,13 @@ func (s *State) failWith(base int) error {
 		msg = "error object of type " + C.GoString(C.bridge_typename(s.l, -1))
 	}
 	C.bridge_settop(s.l, C.int(base))
+
+	switch {
+	case status == C.bridge_errmem():
+		return fmt.Errorf("%w: %s", ErrMemory, msg)
+	case C.bridge_isinterrupted(s.l) != 0:
+		return fmt.Errorf("%w: %s", ErrInterrupted, msg)
+	}
 	return errors.New(msg)
 }
 
@@ -108,8 +231,8 @@ func (s *State) Load(bytecode []byte, chunkname string) error {
 	name := C.CString(chunkname)
 	defer C.free(unsafe.Pointer(name))
 
-	if C.bridge_load(s.l, name, (*C.char)(unsafe.Pointer(&bytecode[0])), C.size_t(len(bytecode))) != 0 {
-		return s.failWith(base)
+	if st := C.bridge_load(s.l, name, (*C.char)(unsafe.Pointer(&bytecode[0])), C.size_t(len(bytecode))); st != 0 {
+		return s.failWith(base, st)
 	}
 	return nil
 }
@@ -136,8 +259,8 @@ func (s *State) Call(args ...any) ([]any, error) {
 			return nil, err
 		}
 	}
-	if C.bridge_pcall(s.l, C.int(len(args)), multRet) != 0 {
-		return nil, s.failWith(base)
+	if st := C.bridge_pcall(s.l, C.int(len(args)), multRet); st != 0 {
+		return nil, s.failWith(base, st)
 	}
 
 	// The results now occupy base+1 .. Top().
@@ -166,8 +289,8 @@ func (s *State) DoString(src string) error {
 	if err := s.Load(bc, "=dostring"); err != nil {
 		return err
 	}
-	if C.bridge_pcall(s.l, 0, 0) != 0 {
-		return s.failWith(base)
+	if st := C.bridge_pcall(s.l, 0, 0); st != 0 {
+		return s.failWith(base, st)
 	}
 	return nil
 }

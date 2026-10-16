@@ -1,5 +1,6 @@
 #include <stdlib.h>
-
+#include <atomic>
+#include <new>
 #include "bridge.h"
 #include "lua.h"
 #include "lualib.h"
@@ -30,21 +31,116 @@ static int trampoline(lua_State* L) {
     return n;
 }
 
-extern "C" {
-    lua_State* bridge_newstate(uintptr_t handle) {
-        lua_State* L = luaL_newstate();
-        if (L) {
-            luaL_openlibs(L);
-            // Stash the Go State handle so callbacks can find their way back.
-            // Callbacks are shared by all coroutines of this state.
-            lua_callbacks(L)->userdata = (void*)handle;
-            lua_setuserdatadtor(L, GO_UDATA_TAG, go_udata_dtor);
+// Per-state host data. It is the allocator's `ud`, and also lives in
+// lua_callbacks(L)->userdata, so callbacks can find it from any thread.
+struct Host {
+    uintptr_t handle;            // cgo.Handle of the Go State
+    size_t used;                 // bytes currently allocated
+    size_t limit;                // 0 = unlimited
+    std::atomic<int> interrupted;
+};
+
+static Host* host_of(lua_State* L) { return (Host*)lua_callbacks(L)->userdata; }
+
+// Allocator with usage tracking and an optional limit. Returning NULL makes
+// Luau raise an out-of-memory error, which pcall catches.
+static void* host_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
+    Host* h = (Host*)ud;
+    size_t old = ptr ? osize : 0;   // for new blocks Luau's osize is not a size
+    size_t base = h->used >= old ? h->used - old : 0;
+
+    if (nsize == 0) {
+        free(ptr);
+        h->used = base;
+        return nullptr;
+    }
+    if (h->limit && nsize > old && base + nsize > h->limit) return nullptr;
+
+    void* p = realloc(ptr, nsize);
+    if (!p) return nullptr;
+    h->used = base + nsize;
+    return p;
+}
+
+// Runs at Luau safepoints (loop back edges, calls, returns, GC steps).
+// While the flag is set it keeps raising an error at every safepoint, so a
+// script can't simply catch the error with pcall and carry on.
+static void interrupt_cb(lua_State* L, int gc) {
+    if (gc >= 0) return;   // inside a GC step: never raise an error here
+    if (host_of(L)->interrupted.load(std::memory_order_relaxed))
+        luaL_error(L, "script interrupted");
+}
+
+struct LibEntry { unsigned flag; const char* name; int (*fn)(lua_State*); };
+static const LibEntry kLibs[] = {
+    { BRIDGE_LIB_BASE,      "",          luaopen_base },
+    { BRIDGE_LIB_COROUTINE, "coroutine", luaopen_coroutine },
+    { BRIDGE_LIB_TABLE,     "table",     luaopen_table },
+    { BRIDGE_LIB_OS,        "os",        luaopen_os },
+    { BRIDGE_LIB_STRING,    "string",    luaopen_string },
+    { BRIDGE_LIB_BIT32,     "bit32",     luaopen_bit32 },
+    { BRIDGE_LIB_BUFFER,    "buffer",    luaopen_buffer },
+    { BRIDGE_LIB_UTF8,      "utf8",      luaopen_utf8 },
+    { BRIDGE_LIB_CLASS,     "class",     luaopen_class },
+    { BRIDGE_LIB_MATH,      "math",      luaopen_math },
+    { BRIDGE_LIB_DEBUG,     "debug",     luaopen_debug },
+    { BRIDGE_LIB_VECTOR,    "vector",    luaopen_vector },
+    { BRIDGE_LIB_INTEGER,   "integer",   luaopen_integer },
+};
+
+static int open_libs(lua_State* L, unsigned libs) {
+    try {
+        if (libs == 0) { luaL_openlibs(L); return 0; }   // the default set
+        for (const LibEntry& e : kLibs) {
+            if (libs & e.flag) {
+                lua_pushcfunction(L, e.fn, nullptr);
+                lua_pushstring(L, e.name);
+                lua_call(L, 1, 0);
+            }
         }
+        return 0;
+    } catch (...) { return -1; }
+}
+
+extern "C" {
+    lua_State* bridge_newstate(uintptr_t handle, unsigned int libs, size_t memlimit) {
+        Host* h = new (std::nothrow) Host();
+        if (!h) return nullptr;
+        h->handle = handle;
+        h->used = 0;
+        h->limit = memlimit;
+        h->interrupted = 0;
+
+        lua_State* L = nullptr;
+        try { L = lua_newstate(host_alloc, h); } catch (...) {}
+        if (!L) { delete h; return nullptr; }
+
+        lua_callbacks(L)->userdata = h;
+        lua_callbacks(L)->interrupt = interrupt_cb;
+        lua_setuserdatadtor(L, GO_UDATA_TAG, go_udata_dtor);
+
+        if (open_libs(L, libs) != 0) { bridge_close(L); return nullptr; }
         return L;
     }
 
-    uintptr_t bridge_getuserdata(lua_State* L) {
-        return (uintptr_t)lua_callbacks(L)->userdata;
+    void bridge_close(lua_State* L) {
+        void* ud = nullptr;
+        lua_getallocf(L, &ud);   // fetch the Host before the state goes away
+        lua_close(L);            // frees every object through host_alloc
+        delete (Host*)ud;        // so the Host must outlive lua_close
+    }
+
+    uintptr_t bridge_getuserdata(lua_State* L) { return host_of(L)->handle; }
+
+    size_t bridge_memused(lua_State* L) { return host_of(L)->used; }
+    int bridge_errmem(void) { return LUA_ERRMEM; }
+
+    void bridge_interrupt(lua_State* L) { host_of(L)->interrupted.store(1); }
+    void bridge_clearinterrupt(lua_State* L) { host_of(L)->interrupted.store(0); }
+    int bridge_isinterrupted(lua_State* L) { return host_of(L)->interrupted.load(); }
+
+    void bridge_sandbox(lua_State* L) {
+        try { luaL_sandbox(L); } catch (...) {}
     }
 
     // Pushes a Luau function that calls Go function `id`.
@@ -56,8 +152,6 @@ extern "C" {
             return 0;
         } catch (...) { return -1; }
     }
-
-    void bridge_close(lua_State* L) { lua_close(L); }
 
     char* bridge_compile(const char* src, size_t len, size_t* outlen) {
         try {

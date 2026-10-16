@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"context"
+	"time"
 
 	"github.com/Leoj030/go-luau/luau"
 )
@@ -637,5 +639,237 @@ func TestUserdataFinalizedOnClose(t *testing.T) {
 	L.Close()
 	if finalized != 1 {
 		t.Errorf("finalized = %d after Close, want 1", finalized)
+	}
+}
+
+func TestLibrarySelection(t *testing.T) {
+	L, err := luau.NewStateWith(luau.Options{Libs: luau.LibBase | luau.LibMath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(L.Close)
+
+	if err := L.DoString(`hasMath = math ~= nil  hasString = string ~= nil  hasOS = os ~= nil`); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"hasMath": true, "hasString": false, "hasOS": false} {
+		if got, _ := L.GetGlobal(name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestNoLibraries(t *testing.T) {
+	L, err := luau.NewStateWith(luau.Options{Libs: luau.LibNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(L.Close)
+
+	if err := L.DoString(`hasPrint = print ~= nil  hasMath = math ~= nil  x = 1 + 2`); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := L.GetGlobal("hasPrint"); got != false {
+		t.Errorf("print should not exist without the base library, got %v", got)
+	}
+	if got, _ := L.GetGlobal("hasMath"); got != false {
+		t.Errorf("math should not exist, got %v", got)
+	}
+	if got, _ := L.GetGlobal("x"); got != 3.0 {
+		t.Errorf("plain code should still run, got %v", got)
+	}
+}
+
+// Guards against LibAll drifting from what luaL_openlibs opens.
+// Guards against LibDefault drifting from what luaL_openlibs opens.
+func TestLibDefaultMatchesDefaultSet(t *testing.T) {
+	const dump = `
+		local names = {}
+		for k, v in pairs(_G) do
+			names[#names + 1] = tostring(k)
+			if type(v) == "table" then
+				for k2 in pairs(v) do names[#names + 1] = tostring(k) .. "." .. tostring(k2) end
+			end
+		end
+		table.sort(names)
+		result = table.concat(names, ",")`
+
+	a := newState(t) // zero-value options: the default set
+	b, err := luau.NewStateWith(luau.Options{Libs: luau.LibDefault})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	if err := a.DoString(dump); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DoString(dump); err != nil {
+		t.Fatal(err)
+	}
+	ra, _ := a.GetGlobal("result")
+	rb, _ := b.GetGlobal("result")
+	if ra != rb {
+		t.Errorf("LibDefault differs from the default set:\n default:    %v\n LibDefault: %v", ra, rb)
+	}
+}
+
+func TestOptionalLibraries(t *testing.T) {
+	L, err := luau.NewStateWith(luau.Options{Libs: luau.LibAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(L.Close)
+
+	if err := L.DoString(`hasClass = class ~= nil  hasInteger = integer ~= nil`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hasClass", "hasInteger"} {
+		if got, _ := L.GetGlobal(name); got != true {
+			t.Errorf("%s = %v, want true", name, got)
+		}
+	}
+
+	// A default state does not have them.
+	d := newState(t)
+	d.DoString(`hasClass = class ~= nil  hasInteger = integer ~= nil`)
+	for _, name := range []string{"hasClass", "hasInteger"} {
+		if got, _ := d.GetGlobal(name); got != false {
+			t.Errorf("default state: %s = %v, want false", name, got)
+		}
+	}
+}
+
+func TestOptionsValidation(t *testing.T) {
+	if _, err := luau.NewStateWith(luau.Options{MemoryLimit: -1}); err == nil {
+		t.Error("a negative MemoryLimit should fail")
+	}
+}
+
+func TestMemoryUsed(t *testing.T) {
+	L := newState(t)
+	before := L.MemoryUsed()
+	if before <= 0 {
+		t.Fatalf("a fresh state should report some memory, got %d", before)
+	}
+	if err := L.DoString(`big = string.rep("x", 1048576)`); err != nil {
+		t.Fatal(err)
+	}
+	after := L.MemoryUsed()
+	if after < before+(1<<20) {
+		t.Errorf("used %d -> %d, expected growth of at least 1 MiB", before, after)
+	}
+	L.DoString(`big = nil`)
+	L.GC()
+	if L.MemoryUsed() >= after {
+		t.Errorf("memory not released after GC: %d -> %d", after, L.MemoryUsed())
+	}
+}
+
+func TestMemoryLimit(t *testing.T) {
+	L, err := luau.NewStateWith(luau.Options{MemoryLimit: 8 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(L.Close)
+
+	err = L.DoString(`local t = {} for i = 1, 1e9 do t[i] = i end`)
+	if !errors.Is(err, luau.ErrMemory) {
+		t.Fatalf("got %v, want ErrMemory", err)
+	}
+	if used := L.MemoryUsed(); used > 8<<20 {
+		t.Errorf("used %d bytes, above the 8 MiB limit", used)
+	}
+
+	// The state is still usable once the garbage is collected.
+	L.GC()
+	if err := L.DoString(`y = 1`); err != nil {
+		t.Errorf("state unusable after hitting the limit: %v", err)
+	}
+}
+
+func TestMemoryLimitTooSmall(t *testing.T) {
+	if _, err := luau.NewStateWith(luau.Options{MemoryLimit: 1024}); err == nil {
+		t.Error("a 1 KiB limit can't even hold the libraries, so creation should fail")
+	}
+}
+
+func TestInterruptStopsInfiniteLoop(t *testing.T) {
+	L := newState(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	stop := L.WatchContext(ctx)
+	start := time.Now()
+	err := L.DoString(`while true do end`)
+	stop()
+
+	if !errors.Is(err, luau.ErrInterrupted) {
+		t.Fatalf("got %v, want ErrInterrupted", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("took %v to stop", time.Since(start))
+	}
+
+	// After stop(), the state runs normally again.
+	if err := L.DoString(`x = 1`); err != nil {
+		t.Errorf("state unusable after an interrupt: %v", err)
+	}
+}
+
+func TestInterruptFromAnotherGoroutine(t *testing.T) {
+	L := newState(t)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		L.Interrupt()
+	}()
+	err := L.DoString(`local n = 0 while true do n = n + 1 end`)
+	if !errors.Is(err, luau.ErrInterrupted) {
+		t.Fatalf("got %v, want ErrInterrupted", err)
+	}
+	L.ClearInterrupt()
+	if err := L.DoString(`x = 1`); err != nil {
+		t.Errorf("state unusable after ClearInterrupt: %v", err)
+	}
+}
+
+func TestWatchContextAlreadyCancelled(t *testing.T) {
+	L := newState(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stop := L.WatchContext(ctx)
+	defer stop()
+	if err := L.DoString(`while true do end`); !errors.Is(err, luau.ErrInterrupted) {
+		t.Errorf("got %v, want ErrInterrupted", err)
+	}
+}
+
+func TestSandbox(t *testing.T) {
+	L := newState(t)
+	L.SetGlobal("hostValue", 1) // set up before sandboxing
+	L.Sandbox()
+
+	for _, src := range []string{`x = 1`, `math.floor = nil`, `string.upper = print`} {
+		err := L.DoString(src)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "readonly") {
+			t.Errorf("%q: got %v, want a read-only error", src, err)
+		}
+	}
+
+	// Reading is unaffected. (Results come back through Call, since scripts
+	// can no longer assign globals.)
+	bc, _ := luau.Compile(`return math.floor(hostValue + 1.5)`)
+	L.Load(bc, "=read")
+	res, err := L.Call()
+	if err != nil || len(res) != 1 || res[0] != 2.0 {
+		t.Errorf("read after sandbox: %v, %v", res, err)
+	}
+
+	// The host is locked out of the globals table too.
+	if err := L.SetGlobal("late", 1); err == nil {
+		t.Error("SetGlobal after Sandbox should fail")
+	}
+	if L.Top() != 0 {
+		t.Errorf("stack not clean: %d", L.Top())
 	}
 }

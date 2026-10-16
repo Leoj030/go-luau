@@ -11,7 +11,36 @@ extern "C" {
 
     typedef struct lua_State lua_State;
 
-    lua_State* bridge_newstate(uintptr_t handle);
+    // Library flags for bridge_newstate. 0 means "luaL_openlibs" (the default set).
+    enum {
+        BRIDGE_LIB_BASE      = 1 << 0,
+        BRIDGE_LIB_COROUTINE = 1 << 1,
+        BRIDGE_LIB_TABLE     = 1 << 2,
+        BRIDGE_LIB_OS        = 1 << 3,
+        BRIDGE_LIB_STRING    = 1 << 4,
+        BRIDGE_LIB_BIT32     = 1 << 5,
+        BRIDGE_LIB_BUFFER    = 1 << 6,
+        BRIDGE_LIB_UTF8      = 1 << 7,
+        BRIDGE_LIB_CLASS     = 1 << 8,
+        BRIDGE_LIB_MATH      = 1 << 9,
+        BRIDGE_LIB_DEBUG     = 1 << 10,
+        BRIDGE_LIB_VECTOR    = 1 << 11,
+        BRIDGE_LIB_INTEGER   = 1 << 12,
+        BRIDGE_LIB_NONE      = 1 << 30
+    };
+
+    // memlimit is in bytes; 0 means unlimited.
+    lua_State* bridge_newstate(uintptr_t handle, unsigned int libs, size_t memlimit);
+
+    size_t bridge_memused(lua_State* L);
+    int bridge_errmem(void);   // the status code Luau uses for out-of-memory
+
+    // Interrupt flag. bridge_interrupt is safe to call from any thread.
+    void bridge_interrupt(lua_State* L);
+    void bridge_clearinterrupt(lua_State* L);
+    int bridge_isinterrupted(lua_State* L);
+
+    void bridge_sandbox(lua_State* L);
     uintptr_t bridge_getuserdata(lua_State* L);
     int bridge_pushgofunction(lua_State* L, int id, const char* name);
     void bridge_close(lua_State* L);

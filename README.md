@@ -2,7 +2,7 @@
 
 Go bindings for [Luau](https://luau.org), built with cgo. The binding stays close to Luau's C API and stays out of policy. It has no require, no scheduler, and no opinion on what a script's global API should look like, so you decide what your scripts can see and do.
 
-> **Status: early development.** The API will change. It has only been built and tested on Linux so far, and it does **not** yet provide sandboxing, memory limits or timeouts, so don't run untrusted scripts with it yet. See [Limitations](#limitations).
+> **Status: early development.** The API will change. It has only been built and tested on Linux so far. Sandboxing, memory limits and cancellation exist, but they haven't been security-reviewed, so be careful before running untrusted scripts. See [Limitations](#limitations).
 
 ## Features
 
@@ -12,6 +12,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Tables and references.** Build and read tables from Go, iterate them, and keep Luau values alive from Go with `Ref`.
 - **Userdata.** Hand Go objects to scripts, give them methods through metatables, and get a `Finalize` callback when Luau garbage-collects them.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
+- **Sandboxing and limits.** Pick which standard libraries a state opens, cap its memory, lock down its globals with `Sandbox`, and stop runaway scripts from another goroutine or on a `context` timeout.
 
 ## Requirements
 
@@ -87,16 +88,18 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 
 ### Overview
 
-| Area         | API                                                                                  |
-|--------------|--------------------------------------------------------------------------------------|
-| Lifecycle    | `NewState`, `Close`, `GC`, `Top`, `Pop`, `TypeName`                                  |
-| Running code | `Compile`, `Load`, `Call`, `DoString`                                                |
-| Values       | `Push`, `Get` (nil, bool, number, string)                                            |
-| Globals      | `SetGlobal`, `GetGlobal`, `PushGlobal`, `PopGlobal`                                  |
-| Tables       | `NewTable`, `GetField`, `SetField`, `GetIndex`, `SetIndex`, `Len`, `Next`, `ForEach` |
-| References   | `Ref`, `PushRef`, `Unref`                                                            |
-| Go functions | `Register`, `PushFunction`                                                           |
-| Userdata     | `PushUserdata`, `ToUserdata`, `SetMetatable`, the `Finalizer` interface              |
+| Area          | API                                                                                     |
+|---------------|-----------------------------------------------------------------------------------------|
+| Lifecycle     | `NewState`, `Close`, `GC`, `Top`, `Pop`, `TypeName`                                     |
+| Running code  | `Compile`, `Load`, `Call`, `DoString`                                                   |
+| Values        | `Push`, `Get` (nil, bool, number, string)                                               |
+| Globals       | `SetGlobal`, `GetGlobal`, `PushGlobal`, `PopGlobal`                                     |
+| Tables        | `NewTable`, `GetField`, `SetField`, `GetIndex`, `SetIndex`, `Len`, `Next`, `ForEach`    |
+| References    | `Ref`, `PushRef`, `Unref`                                                               |
+| Go functions  | `Register`, `PushFunction`                                                              |
+| Userdata      | `PushUserdata`, `ToUserdata`, `SetMetatable`, the `Finalizer` interface                 |
+| Configuration | `NewStateWith(Options{Libs, MemoryLimit})`, `Lib*` flags, `MemoryUsed`                  |
+| Safety        | `Sandbox`, `Interrupt`, `ClearInterrupt`, `WatchContext`, `ErrMemory`, `ErrInterrupted` |
 
 See the doc comments in [`luau/luau.go`](luau/luau.go) for exact behavior.
 
@@ -111,13 +114,16 @@ See the doc comments in [`luau/luau.go`](luau/luau.go) for exact behavior.
 - **Finalizers run during garbage collection.** `Finalize` must be quick and must not call back into the `State`.
 - **`collectgarbage` isn't exposed to scripts** by the vendored Luau version. Use `L.GC()` from Go, or register your own function that calls it.
 - **Invalid stack indices return errors**, not crashes. Luau itself is unsafe to query out of range, so the binding checks in Go first.
+- **Default libraries.** A zero-value `Options` opens what `luaL_openlibs` opens. `LibAll` additionally enables `class` and `integer`, and `LibNone` opens nothing, not even `print`.
+- **Memory limits are in bytes** and count everything the state allocates. Hitting the limit fails the running script with an error wrapping `ErrMemory`, and the state stays usable after a `GC()`.
+- **Call `Interrupt` only on a live state.** `WatchContext` handles this for you: call its returned `stop` function before `Close`.
 
 ## Limitations
 
 What the binding doesn't do yet:
 
-- **No sandboxing.** `luaL_sandbox` isn't wrapped, and `NewState` opens every standard library. Don't run untrusted scripts.
-- **No memory limit and no timeouts or cancellation.**
+- **`Sandbox` is state-wide.** It makes the globals table read-only for scripts and for the host, so set everything up before calling it. Per-script environments (`luaL_sandboxthread`) will arrive with the coroutine API.
+- **Cancellation is cooperative.** `Interrupt` stops Luau code at safepoints (loops and calls). It can't stop a Go function that blocks.
 - **No coroutine API** (create, resume, yield).
 - **Only nil, bool, number and string convert to Go values.** Reading other types, such as tables, functions, vectors and buffers, with `Get` returns an error. Use the table and reference functions instead.
 - **Table keys are limited** to strings and integers.
