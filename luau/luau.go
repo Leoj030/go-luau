@@ -59,22 +59,115 @@ func (s *State) Close() {
 // Returns the number of values on the stack (inside a Func: the argument count).
 func (s *State) Top() int { return int(C.bridge_gettop(s.l)) }
 
-// Compiles and runs src. Lua errors come back as a Go error.
-func (s *State) DoString(src string) error {
-	csrc := C.CString(src)
+// multRet asks Luau to return every result (LUA_MULTRET).
+const multRet = -1
+
+// Turns Luau source into bytecode. The result can be cached and
+// loaded into any number of states.
+//
+// Compile does not report syntax errors: Luau encodes a failed compile as
+// special bytecode, and Load returns the error (with the chunk name).
+func Compile(src string) ([]byte, error) {
+	csrc := C.CString(src) // never NULL, even for an empty string
 	defer C.free(unsafe.Pointer(csrc))
-	name := C.CString("=dostring")
+
+	var n C.size_t
+	p := C.bridge_compile(csrc, C.size_t(len(src)), &n)
+	if p == nil {
+		return nil, errors.New("luau: compile failed (out of memory)")
+	}
+	defer C.free(unsafe.Pointer(p)) // luau_compile returns a malloc'd buffer
+	return C.GoBytes(unsafe.Pointer(p), C.int(n)), nil
+}
+
+// Builds a Go error from the error value on top of the stack,
+// then truncates the stack back to base.
+func (s *State) failWith(base int) error {
+	var n C.size_t
+	msg := ""
+	if p := C.bridge_tostring(s.l, -1, &n); p != nil {
+		msg = C.GoStringN(p, C.int(n)) // copy before the stack is truncated
+	} else {
+		msg = "error object of type " + C.GoString(C.bridge_typename(s.l, -1))
+	}
+	C.bridge_settop(s.l, C.int(base))
+	return errors.New(msg)
+}
+
+// Loads bytecode and pushes the resulting chunk onto the stack as a
+// function. Syntax errors from Compile are reported here.
+//
+// chunkname labels the chunk in error messages. A name starting with "="
+// is used as-is ("=script" appears as "script:1: ..."), and "@" marks a
+// file name.
+func (s *State) Load(bytecode []byte, chunkname string) error {
+	if len(bytecode) == 0 {
+		return errors.New("luau: empty bytecode")
+	}
+	base := s.Top()
+	name := C.CString(chunkname)
 	defer C.free(unsafe.Pointer(name))
 
-	if status := C.bridge_dostring(s.l, csrc, C.size_t(len(src)), name); status != 0 {
-		var n C.size_t
-		p := C.bridge_tostring(s.l, -1, &n)
-		msg := "unknown error"
-		if p != nil {
-			msg = C.GoStringN(p, C.int(n))
+	if C.bridge_load(s.l, name, (*C.char)(unsafe.Pointer(&bytecode[0])), C.size_t(len(bytecode))) != 0 {
+		return s.failWith(base)
+	}
+	return nil
+}
+
+// Calls the function on top of the stack with args and returns its
+// results as Go values. It consumes the function, and the stack is left
+// as it was below it, on success and on error alike.
+//
+// Results use the same conversions as Get, so a result of an unsupported
+// type (such as a table) returns an error.
+func (s *State) Call(args ...any) ([]any, error) {
+	if s.Top() < 1 {
+		return nil, errors.New("luau: Call needs a function on the stack")
+	}
+	base := s.Top() - 1 // number of values below the function
+
+	if C.bridge_checkstack(s.l, C.int(len(args)+1)) == 0 {
+		C.bridge_settop(s.l, C.int(base))
+		return nil, errors.New("luau: stack overflow")
+	}
+	for _, a := range args {
+		if err := s.Push(a); err != nil {
+			C.bridge_settop(s.l, C.int(base))
+			return nil, err
 		}
-		C.bridge_settop(s.l, 0)
-		return errors.New(msg)
+	}
+	if C.bridge_pcall(s.l, C.int(len(args)), multRet) != 0 {
+		return nil, s.failWith(base)
+	}
+
+	// The results now occupy base+1 .. Top().
+	n := s.Top() - base
+	results := make([]any, 0, n)
+	for i := 1; i <= n; i++ {
+		v, err := s.Get(base + i)
+		if err != nil {
+			C.bridge_settop(s.l, C.int(base))
+			return nil, err
+		}
+		results = append(results, v)
+	}
+	C.bridge_settop(s.l, C.int(base))
+	return results, nil
+}
+
+// Compiles and runs src, discarding any results. Luau errors are
+// returned as a Go error.
+func (s *State) DoString(src string) error {
+	bc, err := Compile(src)
+	if err != nil {
+		return err
+	}
+	base := s.Top()
+	if err := s.Load(bc, "=dostring"); err != nil {
+		return err
+	}
+	if C.bridge_pcall(s.l, 0, 0) != 0 {
+		return s.failWith(base)
 	}
 	return nil
 }
@@ -235,4 +328,321 @@ func goCallback(L *C.lua_State, id C.int) (ret C.int) {
 		return -1
 	}
 	return C.int(n)
+}
+
+// abs converts a negative stack index into an absolute one, using the
+// stack height at the time of the call.
+func (s *State) abs(idx int) int {
+	if idx < 0 {
+		return s.Top() + idx + 1
+	}
+	return idx
+}
+
+// Reports whether idx refers to an existing stack slot. Luau is not
+// safe to ask about indices outside the stack, so check first.
+func (s *State) valid(idx int) bool {
+	top := s.Top()
+	return (idx >= 1 && idx <= top) || (idx <= -1 && idx >= -top)
+}
+
+// Returns the Luau type name of the value at idx ("nil", "boolean",
+// "number", "string", "table", "function", "userdata", ...), or "no value"
+// if idx is not a valid stack position.
+func (s *State) TypeName(idx int) string {
+	if !s.valid(idx) {
+		return "no value"
+	}
+	return C.GoString(C.bridge_typename(s.l, C.int(idx)))
+}
+
+// Pop removes n values from the top of the stack.
+func (s *State) Pop(n int) error {
+	top := s.Top()
+	if n < 0 || n > top {
+		return fmt.Errorf("luau: cannot pop %d values from a stack of %d", n, top)
+	}
+	C.bridge_settop(s.l, C.int(top-n))
+	return nil
+}
+
+// checkTable guards every raw table operation. Luau does not validate
+// types in release builds, so touching a non-table would corrupt memory.
+func (s *State) checkTable(idx int) error {
+	if tn := s.TypeName(idx); tn != "table" {
+		return fmt.Errorf("luau: stack index %d is %s, not a table", idx, tn)
+	}
+	return nil
+}
+
+// PushGlobal pushes the global called name without converting it, so it
+// works for any type (functions, tables, ...). Pop it when you're done.
+func (s *State) PushGlobal(name string) error {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	if C.bridge_getglobal(s.l, cname) != 0 {
+		return fmt.Errorf("luau: failed to get global %q", name)
+	}
+	return nil
+}
+
+// PopGlobal pops the value on top of the stack and assigns it to the
+// global called name.
+func (s *State) PopGlobal(name string) error {
+	top := s.Top()
+	if top < 1 {
+		return errors.New("luau: PopGlobal needs a value on the stack")
+	}
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	if C.bridge_setglobal(s.l, cname) != 0 {
+		C.bridge_settop(s.l, C.int(top-1))
+		return fmt.Errorf("luau: failed to set global %q", name)
+	}
+	return nil
+}
+
+// Pushes a new empty table. narr and nrec are size hints for the
+// array and hash parts (0 is fine).
+func (s *State) NewTable(narr, nrec int) error {
+	if C.bridge_createtable(s.l, C.int(narr), C.int(nrec)) != 0 {
+		return errors.New("luau: failed to create table")
+	}
+	return nil
+}
+
+// Pushes t[key], where t is the table at idx. The key must not
+// contain NUL bytes. Raw access: metamethods are not invoked.
+func (s *State) GetField(idx int, key string) error {
+	if err := s.checkTable(idx); err != nil {
+		return err
+	}
+	ck := C.CString(key)
+	defer C.free(unsafe.Pointer(ck))
+	if C.bridge_rawgetfield(s.l, C.int(idx), ck) != 0 {
+		return fmt.Errorf("luau: failed to get field %q", key)
+	}
+	return nil
+}
+
+// Validates the "table at idx, value on top" layout that the
+// Set* functions use, and returns the table's absolute index.
+func (s *State) checkStore(idx int) (int, error) {
+	top := s.Top()
+	t := s.abs(idx)
+	if top < 2 || t < 1 || t >= top {
+		return 0, errors.New("luau: need a table and, above it, a value to store")
+	}
+	return t, s.checkTable(t)
+}
+
+// Does t[key] = value, where t is the table at idx and value is
+// the top of the stack. The value is popped. Raw access.
+func (s *State) SetField(idx int, key string) error {
+	t, err := s.checkStore(idx)
+	if err != nil {
+		return err
+	}
+	top := s.Top()
+	ck := C.CString(key)
+	defer C.free(unsafe.Pointer(ck))
+	if C.bridge_rawsetfield(s.l, C.int(t), ck) != 0 {
+		C.bridge_settop(s.l, C.int(top-1))
+		return fmt.Errorf("luau: failed to set field %q", key)
+	}
+	return nil
+}
+
+// Pushes t[n] (arrays are 1-based in Luau), where t is the table
+// at idx. Raw access.
+func (s *State) GetIndex(idx, n int) error {
+	if err := s.checkTable(idx); err != nil {
+		return err
+	}
+	if C.bridge_rawgeti(s.l, C.int(idx), C.int(n)) != 0 {
+		return fmt.Errorf("luau: failed to get index %d", n)
+	}
+	return nil
+}
+
+// Does t[n] = value (1-based), where t is the table at idx and
+// value is the top of the stack. The value is popped. Raw access.
+func (s *State) SetIndex(idx, n int) error {
+	t, err := s.checkStore(idx)
+	if err != nil {
+		return err
+	}
+	top := s.Top()
+	if C.bridge_rawseti(s.l, C.int(t), C.int(n)) != 0 {
+		C.bridge_settop(s.l, C.int(top-1))
+		return fmt.Errorf("luau: failed to set index %d", n)
+	}
+	return nil
+}
+
+// Returns the raw length of the array part of the table at idx (like
+// the # operator without metamethods).
+func (s *State) Len(idx int) (int, error) {
+	if err := s.checkTable(idx); err != nil {
+		return 0, err
+	}
+	return int(C.bridge_objlen(s.l, C.int(idx))), nil
+}
+
+// Advances a table traversal. With the table at idx and a key on top
+// of the stack (push nil to start), it pops the key and pushes the next
+// key and value, returning true. At the end it pops the key, pushes
+// nothing and returns false. Iteration order is unspecified. Most callers
+// want ForEach instead.
+func (s *State) Next(idx int) (bool, error) {
+	if s.Top() < 2 {
+		return false, errors.New("luau: Next needs a table and a key on the stack")
+	}
+	t := s.abs(idx)
+	if err := s.checkTable(t); err != nil {
+		return false, err
+	}
+	switch C.bridge_next(s.l, C.int(t)) {
+	case 0:
+		return false, nil
+	case -1:
+		return false, errors.New("luau: table traversal failed")
+	}
+	return true, nil
+}
+
+// Calls fn once per entry of the table at idx. While fn runs, the
+// key is at stack index -2 and the value at -1. fn must leave the stack as
+// it found it. If fn returns an error, iteration stops, the stack is
+// restored and the error is returned.
+//
+// Don't convert a key with anything that changes it in place (Get is safe).
+func (s *State) ForEach(idx int, fn func() error) error {
+	t := s.abs(idx)
+	if err := s.checkTable(t); err != nil {
+		return err
+	}
+	base := s.Top()
+	s.Push(nil) // first key
+	for {
+		ok, err := s.Next(t)
+		if err != nil {
+			C.bridge_settop(s.l, C.int(base))
+			return err
+		}
+		if !ok {
+			return nil // Next already popped the key
+		}
+		if err := fn(); err != nil {
+			C.bridge_settop(s.l, C.int(base))
+			return err
+		}
+		s.Pop(1) // drop the value, keep the key for the next step
+	}
+}
+
+// A handle that keeps a Luau value alive so Go can hold on to it
+// across calls. Release it with Unref when you're done: references are
+// never collected automatically (they do go away when the state closes).
+// A Ref is valid in the state that created it and in all its coroutines.
+type Ref int
+
+// Pins the value at idx and returns a handle to it. The value stays on
+// the stack; pop it yourself if you don't need it there.
+func (s *State) Ref(idx int) (Ref, error) {
+	if s.TypeName(idx) == "no value" {
+		return 0, fmt.Errorf("luau: stack index %d is not valid", idx)
+	}
+	var r C.int
+	if C.bridge_ref(s.l, C.int(idx), &r) != 0 {
+		return 0, errors.New("luau: failed to create reference")
+	}
+	return Ref(r), nil
+}
+
+// Pushes the value r refers to onto the stack.
+func (s *State) PushRef(r Ref) error {
+	if C.bridge_getref(s.l, C.int(r)) != 0 {
+		return errors.New("luau: failed to push reference")
+	}
+	return nil
+}
+
+// Releases a reference. The value can be collected afterwards, and r
+// must not be used again.
+func (s *State) Unref(r Ref) { C.bridge_unref(s.l, C.int(r)) }
+
+// GC runs a full garbage collection cycle. Values that are no longer
+// reachable (and have no Ref) are freed, and userdata destructors run.
+func (s *State) GC() { C.bridge_gc(s.l) }
+
+// Finalizer is an optional interface for Go values stored in userdata.
+// Finalize runs when Luau garbage-collects the userdata (or when the state
+// closes), so you can release resources there.
+//
+// Finalize runs in the middle of a garbage collection, so it must NOT call
+// back into the State, and it should be quick.
+type Finalizer interface{ Finalize() }
+
+// PushUserdata pushes a userdata that holds the Go value v. v stays alive
+// as long as Luau can still reach the userdata.
+func (s *State) PushUserdata(v any) error {
+	h := cgo.NewHandle(v)
+	if C.bridge_pushuserdata(s.l, C.uintptr_t(h)) != 0 {
+		h.Delete()
+		return errors.New("luau: failed to create userdata")
+	}
+	return nil
+}
+
+// ToUserdata returns the Go value stored in the userdata at idx. The bool
+// is false if idx is invalid or isn't a userdata created by PushUserdata.
+func (s *State) ToUserdata(idx int) (any, bool) {
+	if !s.valid(idx) {
+		return nil, false
+	}
+	h := C.bridge_touserdata(s.l, C.int(idx))
+	if h == 0 {
+		return nil, false
+	}
+	return cgo.Handle(h).Value(), true
+}
+
+// Pops the table on top of the stack and makes it the
+// metatable of the table or userdata at idx. Use it to give userdata
+// methods (an __index table) or operators. Keep a Ref to a shared
+// metatable instead of building one per object.
+//
+// Only tables and userdata are accepted: Luau would otherwise apply the
+// metatable to EVERY value of that type (for example all strings).
+func (s *State) SetMetatable(idx int) error {
+	top := s.Top()
+	if top < 2 {
+		return errors.New("luau: SetMetatable needs a target and a metatable on the stack")
+	}
+	if tn := s.TypeName(-1); tn != "table" {
+		return fmt.Errorf("luau: metatable must be a table, got %s", tn)
+	}
+	target := s.abs(idx)
+	if !s.valid(target) || target >= top {
+		return fmt.Errorf("luau: stack index %d is not a valid target", idx)
+	}
+	if tn := s.TypeName(target); tn != "table" && tn != "userdata" {
+		return fmt.Errorf("luau: cannot set a metatable on a %s", tn)
+	}
+	if C.bridge_setmetatable(s.l, C.int(target)) == 0 {
+		C.bridge_settop(s.l, C.int(top-1))
+		return errors.New("luau: failed to set metatable")
+	}
+	return nil // the metatable was popped
+}
+
+//export goUserdataFinalizer
+func goUserdataFinalizer(h C.uintptr_t) {
+	handle := cgo.Handle(h)
+	defer handle.Delete()
+	defer func() { recover() }() // a panic must never unwind into C
+	if f, ok := handle.Value().(Finalizer); ok {
+		f.Finalize()
+	}
 }
