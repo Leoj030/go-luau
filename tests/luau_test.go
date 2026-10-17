@@ -1,12 +1,12 @@
 package tests
 
 import (
+	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
-	"context"
 	"time"
-	"reflect"
 
 	"github.com/Leoj030/go-luau/luau"
 )
