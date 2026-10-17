@@ -15,6 +15,8 @@ import (
 	"runtime/cgo"
 	"context"
 	"sync"
+	"strconv"
+	"strings"
 
 	_ "github.com/Leoj030/go-luau/luau/core"
 )
@@ -26,12 +28,26 @@ type Func func(L *State) (nresults int, err error)
 
 type State struct {
 	l      *C.lua_State
-	parent *State // non-nil for the per-call view handed to Go functions
+	parent *State // non-nil for call views and threads: the main state
+
+	call     bool // this is the per-call view handed to a Go function
+	yielding bool // a Go function asked to yield (call views only)
+	yieldN   int
+	depth    int // nested Resume depth (main state only)
 
 	handle cgo.Handle
 	funcs  map[int]Func
 	nextID int
 	names  []*C.char // debug names; Luau keeps these pointers, so they live until Close
+}
+
+// Returns the state that owns the Go function registry: the main
+// state itself, or the main state behind a call view or a thread.
+func (s *State) root() *State {
+	if s.parent != nil {
+		return s.parent
+	}
+	return s
 }
 
 // Selects standard libraries for NewStateWith.
@@ -84,6 +100,135 @@ var (
 	// Returned (wrapped) when a script exceeded the memory limit.
 	ErrMemory = errors.New("luau: memory limit exceeded")
 )
+
+// ErrorKind says what went wrong.
+type ErrorKind int
+
+const (
+	KindRuntime     ErrorKind = iota // the script raised an error, or a Go function it called failed
+	KindSyntax                       // the source didn't parse
+	KindMemory                       // the memory limit was exceeded
+	KindInterrupted                  // stopped by Interrupt or a cancelled context
+)
+
+func (k ErrorKind) String() string {
+	switch k {
+	case KindRuntime:
+		return "runtime"
+	case KindSyntax:
+		return "syntax"
+	case KindMemory:
+		return "memory"
+	case KindInterrupted:
+		return "interrupted"
+	}
+	return "unknown"
+}
+
+// Error is what Compile, Load, Call, DoString and Thread.Resume return when
+// a script fails. Use errors.As to get at the fields:
+//
+//	var le *luau.Error
+//	if errors.As(err, &le) { fmt.Println(le.Line, le.Column, le.Traceback) }
+//
+// errors.Is(err, ErrMemory) and errors.Is(err, ErrInterrupted) also work.
+type Error struct {
+	Kind ErrorKind
+
+	// Message is the error text without the "chunk:line:" prefix.
+	Message string
+
+	// Chunk, Line and Column say where it happened. Line and Column count
+	// from 1, and 0 means unknown.
+	//
+	// Syntax errors have a line and a column. Runtime errors have a line
+	// but never a column: Luau's bytecode records lines only. For runtime
+	// errors the position is read from the message Luau produced, and it is
+	// 0 when the error carried none (error("x", 0), or an error raised by a
+	// Go function).
+	Chunk  string
+	Line   int
+	Column int
+
+	// Traceback lists the stack frames at the point of the error, innermost
+	// first, one per line. It is empty for syntax and memory errors.
+	Traceback string
+
+	// Value is the raw error value when it was a string, number or boolean.
+	// For strings it is the full text including any "chunk:line:" prefix.
+	Value any
+
+	// When the script raised a table, function or userdata, HasRef is true
+	// and Ref refers to it: read it with PushRef. Release it with Unref when
+	// you are done. Otherwise it stays alive until the state closes.
+	Ref    Ref
+	HasRef bool
+}
+
+func (e *Error) Error() string {
+	var b strings.Builder
+	b.WriteString(e.Chunk)
+	if e.Line > 0 {
+		if b.Len() > 0 {
+			b.WriteByte(':')
+		}
+		b.WriteString(strconv.Itoa(e.Line))
+		if e.Column > 0 {
+			b.WriteByte(':')
+			b.WriteString(strconv.Itoa(e.Column))
+		}
+	}
+	if b.Len() > 0 {
+		b.WriteString(": ")
+	}
+	b.WriteString(e.Message)
+	return b.String()
+}
+
+// Lets errors.Is match ErrMemory and ErrInterrupted.
+func (e *Error) Unwrap() error {
+	switch e.Kind {
+	case KindMemory:
+		return ErrMemory
+	case KindInterrupted:
+		return ErrInterrupted
+	}
+	return nil
+}
+
+// Splits Luau's "chunk:line: rest" prefix.
+func splitLocation(msg string) (chunk string, line int, rest string, ok bool) {
+	for i := 0; i < len(msg); i++ {
+		if msg[i] != ':' {
+			continue
+		}
+		j := i + 1
+		for j < len(msg) && msg[j] >= '0' && msg[j] <= '9' {
+			j++
+		}
+		if j == i+1 || j >= len(msg) || msg[j] != ':' {
+			continue
+		}
+		n, err := strconv.Atoi(msg[i+1 : j])
+		if err != nil {
+			continue
+		}
+		return msg[:i], n, strings.TrimPrefix(msg[j+1:], " "), true
+	}
+	return "", 0, msg, false
+}
+
+// Returns the traceback recorded for the last error and clears it.
+func (s *State) takeTraceback() string {
+	var n C.size_t
+	p := C.bridge_traceback(s.l, &n)
+	if p == nil || n == 0 {
+		return ""
+	}
+	tb := C.GoStringN(p, C.int(n))
+	C.bridge_cleartraceback(s.l)
+	return tb
+}
 
 // Creates a state with the default libraries and no memory limit.
 func NewState() (*State, error) { return NewStateWith(Options{}) }
@@ -178,11 +323,12 @@ func (s *State) Top() int { return int(C.bridge_gettop(s.l)) }
 // multRet asks Luau to return every result (LUA_MULTRET).
 const multRet = -1
 
-// Turns Luau source into bytecode. The result can be cached and
+// Compile turns Luau source into bytecode. The result can be cached and
 // loaded into any number of states.
 //
-// Compile does not report syntax errors: Luau encodes a failed compile as
-// special bytecode, and Load returns the error (with the chunk name).
+// A syntax error is returned as an *Error (Kind KindSyntax) with the line
+// and column where parsing failed. Chunk is empty, because Compile doesn't
+// know the chunk's name.
 func Compile(src string) ([]byte, error) {
 	csrc := C.CString(src) // never NULL, even for an empty string
 	defer C.free(unsafe.Pointer(csrc))
@@ -193,36 +339,91 @@ func Compile(src string) ([]byte, error) {
 		return nil, errors.New("luau: compile failed (out of memory)")
 	}
 	defer C.free(unsafe.Pointer(p)) // luau_compile returns a malloc'd buffer
-	return C.GoBytes(unsafe.Pointer(p), C.int(n)), nil
+
+	bc := C.GoBytes(unsafe.Pointer(p), C.int(n))
+	if len(bc) > 0 && bc[0] == 0 {
+		// Luau encodes a failed compile as bytecode that starts with 0 and
+		// holds the message. It only has the line, so ask the parser for
+		// the full position.
+		return nil, syntaxError(csrc, len(src), bc)
+	}
+	return bc, nil
 }
 
-// Builds a Go error from the error value on top of the stack,
-// then truncates the stack back to base. status is the Luau status code.
-func (s *State) failWith(base int, status C.int) error {
-	var n C.size_t
-	msg := ""
-	if p := C.bridge_tostring(s.l, -1, &n); p != nil {
-		msg = C.GoStringN(p, C.int(n)) // copy before the stack is truncated
-	} else {
-		msg = "error object of type " + C.GoString(C.bridge_typename(s.l, -1))
+func syntaxError(csrc *C.char, n int, bc []byte) *Error {
+	var line, col C.int
+	var msg *C.char
+	if C.bridge_parseerror(csrc, C.size_t(n), &line, &col, &msg) != 0 {
+		defer C.free(unsafe.Pointer(msg))
+		return &Error{Kind: KindSyntax, Message: C.GoString(msg), Line: int(line), Column: int(col)}
 	}
+	// Fallback: use what the compiler said (":line: message").
+	e := &Error{Kind: KindSyntax, Message: string(bc[1:])}
+	if _, l, rest, ok := splitLocation(e.Message); ok {
+		e.Line, e.Message = l, rest
+	}
+	return e
+}
+
+// failWith builds an *Error from the error value on top of the stack, then
+// truncates the stack back to base. status is the Luau status code.
+func (s *State) failWith(base int, status C.int) *Error {
+	e := &Error{Kind: KindRuntime}
+	isString := false
+
+	switch tn := s.TypeName(-1); tn {
+	case "string":
+		var n C.size_t
+		p := C.bridge_tostring(s.l, -1, &n)
+		e.Message = C.GoStringN(p, C.int(n)) // copy before the stack is truncated
+		e.Value = e.Message
+		isString = true
+	case "nil":
+		e.Message = "nil"
+	case "boolean", "number":
+		e.Value, _ = s.Get(-1)
+		e.Message = fmt.Sprint(e.Value)
+	case "no value":
+		e.Message = "unknown error"
+	default:
+		e.Message = "error object is a " + tn + " value"
+		if r, err := s.Ref(-1); err == nil {
+			e.Ref, e.HasRef = r, true
+		}
+	}
+
+	e.Traceback = s.takeTraceback()
 	C.bridge_settop(s.l, C.int(base))
 
 	switch {
 	case status == C.bridge_errmem():
-		return fmt.Errorf("%w: %s", ErrMemory, msg)
+		e.Kind = KindMemory
 	case C.bridge_isinterrupted(s.l) != 0:
-		return fmt.Errorf("%w: %s", ErrInterrupted, msg)
+		e.Kind = KindInterrupted
 	}
-	return errors.New(msg)
+
+	// Pull "chunk:line:" out of the message, but only if that location
+	// really is one of the frames in the traceback. That keeps text like
+	// "fetch: 404: not found" from a Go function from being misread.
+	if isString && e.Kind != KindMemory {
+		if chunk, line, rest, ok := splitLocation(e.Message); ok &&
+			(e.Traceback == "" || strings.Contains(e.Traceback, chunk+":"+strconv.Itoa(line))) {
+			e.Chunk, e.Line, e.Message = chunk, line, rest
+		}
+	}
+	return e
 }
 
-// Loads bytecode and pushes the resulting chunk onto the stack as a
-// function. Syntax errors from Compile are reported here.
+// Load loads bytecode and pushes the resulting chunk onto the stack as a
+// function.
 //
 // chunkname labels the chunk in error messages. A name starting with "="
 // is used as-is ("=script" appears as "script:1: ..."), and "@" marks a
 // file name.
+//
+// If the bytecode is an encoded compile error, Load returns it as an *Error
+// with Kind KindSyntax (it has a line but no column, because only Compile
+// can find the column).
 func (s *State) Load(bytecode []byte, chunkname string) error {
 	if len(bytecode) == 0 {
 		return errors.New("luau: empty bytecode")
@@ -232,10 +433,15 @@ func (s *State) Load(bytecode []byte, chunkname string) error {
 	defer C.free(unsafe.Pointer(name))
 
 	if st := C.bridge_load(s.l, name, (*C.char)(unsafe.Pointer(&bytecode[0])), C.size_t(len(bytecode))); st != 0 {
-		return s.failWith(base, st)
+		e := s.failWith(base, st)
+		if bytecode[0] == 0 {
+			e.Kind = KindSyntax
+		}
+		return e
 	}
 	return nil
 }
+
 
 // Calls the function on top of the stack with args and returns its
 // results as Go values. It consumes the function, and the stack is left
@@ -278,27 +484,30 @@ func (s *State) Call(args ...any) ([]any, error) {
 	return results, nil
 }
 
-// Compiles and runs src, discarding any results. Luau errors are
-// returned as a Go error.
+// DoString compiles and runs src, discarding any results. Failures are
+// returned as an *Error, with the chunk named "dostring".
 func (s *State) DoString(src string) error {
 	bc, err := Compile(src)
 	if err != nil {
+		var le *Error
+		if errors.As(err, &le) {
+			le.Chunk = "dostring"
+		}
 		return err
 	}
 	base := s.Top()
 	if err := s.Load(bc, "=dostring"); err != nil {
 		return err
 	}
-	if st := C.bridge_pcall(s.l, 0, 0); st != 0 {
+	if st := C.bridge_pcall(s.l, 0, 0); st != 0 { // 0 results: nothing to convert
 		return s.failWith(base, st)
 	}
 	return nil
 }
 
-/*
-	Converts a Go value to its Luau equivalent and pushes it on the stack.
-	Strings are copied into Luau, so the Go string can be freed or modified afterwards.
-*/
+
+// Converts a Go value to its Luau equivalent and pushes it on the stack.
+// Strings are copied into Luau, so the Go string can be freed or modified afterwards.
 func (s *State) Push(v any) error {
 	switch x := v.(type) {
 	case nil:
@@ -329,10 +538,8 @@ func (s *State) Push(v any) error {
 	return nil
 }
 
-/*
-	Reads the Luau value at stack index idx (negative counts from the top,
-	so -1 is the top value) and converts it to a Go value. It doesn't pop it.
-*/
+// Reads the Luau value at stack index idx (negative counts from the top,
+// so -1 is the top value) and converts it to a Go value. It doesn't pop it.
 func (s *State) Get(idx int) (any, error) {
 	switch C.GoString(C.bridge_typename(s.l, C.int(idx))) {
 	case "nil":
@@ -351,17 +558,16 @@ func (s *State) Get(idx int) (any, error) {
 	}
 }
 
-/* 
-	Assigns a Go value to a global variable in the Luau state,
-	so scripts can read it by name (e.g. SetGlobal("name", "Go") lets a
-	script use `name`).
 
-	Globals are shared by every script running in this state. Scripts should
-	copy them into locals for speed, and once the state is sandboxed, set
-	your globals BEFORE sandboxing, because scripts can't modify them after.
-
-	Supported value types: nil, bool, int, int64, float64, string.
-*/
+// Assigns a Go value to a global variable in the Luau state,
+// so scripts can read it by name (e.g. SetGlobal("name", "Go") lets a
+// script use `name`).
+//
+// Globals are shared by every script running in this state. Scripts should
+// copy them into locals for speed, and once the state is sandboxed, set
+// your globals BEFORE sandboxing, because scripts can't modify them after.
+//
+// Supported value types: nil, bool, int, int64, float64, string.
 func (s *State) SetGlobal(name string, v any) error {
 	top := s.Top()
 	if err := s.Push(v); err != nil {
@@ -376,14 +582,13 @@ func (s *State) SetGlobal(name string, v any) error {
 	return nil
 }
 
-/*
-	Reads a global variable from the Luau state and returns it as
-	a Go value. A global that doesn't exist comes back as nil with no error.
 
-	Numbers always come back as float64, because Luau numbers are doubles.
-	Tables, functions and other reference types aren't supported yet and
-	return an error.
-*/
+// Reads a global variable from the Luau state and returns it as
+// a Go value. A global that doesn't exist comes back as nil with no error.
+//
+// Numbers always come back as float64, because Luau numbers are doubles.
+// Tables, functions and other reference types aren't supported yet and
+// return an error.
 func (s *State) GetGlobal(name string) (any, error) {
 	top := s.Top()
 	defer C.bridge_settop(s.l, C.int(top))
@@ -397,15 +602,16 @@ func (s *State) GetGlobal(name string) (any, error) {
 
 // Pushes a Go function onto the stack as a Luau function.
 func (s *State) PushFunction(name string, fn Func) error {
-	id := s.nextID
-	s.nextID++
-	s.funcs[id] = fn
+	r := s.root()
+	id := r.nextID
+	r.nextID++
+	r.funcs[id] = fn
 
 	cname := C.CString(name)
-	s.names = append(s.names, cname) // freed in Close, not now
+	r.names = append(r.names, cname) // freed in Close, not now
 
 	if C.bridge_pushgofunction(s.l, C.int(id), cname) != 0 {
-		delete(s.funcs, id)
+		delete(r.funcs, id)
 		return errors.New("luau: failed to push function")
 	}
 	return nil
@@ -441,19 +647,25 @@ func goCallback(L *C.lua_State, id C.int) (ret C.int) {
 	}
 
 	// L may be a coroutine, not the main thread, so wrap this exact L.
-	call := &State{l: L, parent: main}
+	call := &State{l: L, parent: main, call: true}
 	n, err := fn(call)
 	if err == nil && (n < 0 || n > call.Top()) {
 		err = errors.New("go function returned more results than it pushed")
+	}
+	if err == nil && call.yielding && n != call.yieldN {
+		err = fmt.Errorf("go function yielded %d values but returned %d", call.yieldN, n)
 	}
 	if err != nil {
 		call.Push(err.Error())
 		return -1
 	}
+	if call.yielding {
+		return C.int(-n - 2) // the trampoline decodes this as a yield
+	}
 	return C.int(n)
 }
 
-// abs converts a negative stack index into an absolute one, using the
+// Converts a negative stack index into an absolute one, using the
 // stack height at the time of the call.
 func (s *State) abs(idx int) int {
 	if idx < 0 {
@@ -768,4 +980,220 @@ func goUserdataFinalizer(h C.uintptr_t) {
 	if f, ok := handle.Value().(Finalizer); ok {
 		f.Finalize()
 	}
+}
+
+// Suspends the running coroutine from inside a Go function. Call it as
+// the function's return statement:
+//
+//	return c.Yield(1)
+//
+// The top n stack values are handed to whoever resumed the coroutine. When
+// it is resumed again, the values passed to Resume become the results of
+// the call that yielded.
+//
+// Yielding only works while a coroutine is running under Thread.Resume (or
+// ResumeN). Called from a plain DoString or Call, the script fails with
+// Luau's "attempt to yield across metamethod/C-call boundary" error.
+func (s *State) Yield(nresults int) (int, error) {
+	if !s.call {
+		return 0, errors.New("luau: Yield can only be called from a Go function")
+	}
+	if nresults < 0 || nresults > s.Top() {
+		return 0, fmt.Errorf("luau: cannot yield %d values from a stack of %d", nresults, s.Top())
+	}
+	s.yielding = true
+	s.yieldN = nresults
+	return nresults, nil
+}
+
+// ThreadStatus describes where a coroutine is in its life.
+type ThreadStatus int
+
+const (
+	ThreadRunning   ThreadStatus = iota // executing right now
+	ThreadSuspended                     // loaded but not started, or yielded
+	ThreadNormal                        // has resumed another thread and is waiting for it
+	ThreadFinished                      // ran to completion, or has nothing loaded
+	ThreadFailed                        // stopped with an error and can't be resumed
+)
+
+func (st ThreadStatus) String() string {
+	switch st {
+	case ThreadRunning:
+		return "running"
+	case ThreadSuspended:
+		return "suspended"
+	case ThreadNormal:
+		return "normal"
+	case ThreadFinished:
+		return "finished"
+	case ThreadFailed:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// maxResumeDepth bounds nested resumes (a Go function that resumes a thread
+// that calls the same Go function ...), which would otherwise exhaust the C stack.
+const maxResumeDepth = 64
+
+// Thread is a Luau coroutine. It embeds *State, so Load, Push, Get,
+// SetGlobal and the rest operate on the thread's own stack. Load a chunk
+// onto it and run it with Resume.
+//
+// A Thread stays alive until you call Close, even if nothing in Luau
+// refers to it. Close threads before closing the State they came from.
+type Thread struct {
+	*State
+	main    *State
+	ref     Ref
+	started bool
+}
+
+// Creates a coroutine in the same state. Nothing is left on the stack.
+func (s *State) NewThread() (*Thread, error) {
+	root := s.root()
+	var ref C.int
+	co := C.bridge_newthread(s.l, &ref)
+	if co == nil {
+		return nil, errors.New("luau: failed to create thread")
+	}
+	return &Thread{
+		State: &State{l: co, parent: root},
+		main:  root,
+		ref:   Ref(ref),
+	}, nil
+}
+
+// Close lets Luau collect the thread. The Thread must not be used afterwards.
+func (t *Thread) Close() {
+	if t.State.l == nil {
+		return
+	}
+	if t.main.l != nil {
+		C.bridge_unref(t.main.l, C.int(t.ref))
+	}
+	t.State.l = nil
+}
+
+// Gives the thread its own globals table: reads fall through
+// to the state's globals, but assignments stay private to this thread. Call
+// it before Load, because a chunk captures its environment when it is
+// loaded. For real isolation, call State.Sandbox on the main state first;
+// otherwise scripts can still modify the shared library tables.
+func (t *Thread) SandboxThread() {
+	if t.State.l != nil {
+		C.bridge_sandboxthread(t.State.l)
+	}
+}
+
+// Reports the thread's state.
+func (t *Thread) Status() ThreadStatus {
+	if t.State.l == nil || t.main.l == nil {
+		return ThreadFinished
+	}
+	return ThreadStatus(C.bridge_costatus(t.main.l, t.State.l))
+}
+
+// The stack-level form of Resume. The caller prepares the
+// thread's stack:
+//
+//   - first resume: the function, then nargs arguments (Load, then Push)
+//   - later resumes: exactly nargs values, which become the results of the
+//     call that yielded
+//
+// On success the yielded or returned values are left on the thread's stack,
+// nresults of them, and done says whether the function finished (true) or
+// yielded (false). Read them with Get, GetField and friends, then Pop them
+// before the next resume. This is the form to use when results can be
+// tables or other values Get can't convert.
+//
+// On a script error the stack is cleared and the error is returned, wrapping
+// ErrMemory or ErrInterrupted where they apply. The thread is then
+// ThreadFailed.
+func (t *Thread) ResumeN(nargs int) (nresults int, done bool, err error) {
+	if t.State.l == nil || t.main.l == nil {
+		return 0, false, errors.New("luau: thread is closed")
+	}
+	switch t.Status() {
+	case ThreadSuspended:
+	case ThreadFinished:
+		return 0, false, errors.New("luau: thread has finished, or has nothing loaded")
+	case ThreadFailed:
+		return 0, false, errors.New("luau: thread failed and cannot be resumed")
+	default:
+		return 0, false, errors.New("luau: thread is already running")
+	}
+
+	want := nargs
+	if !t.started {
+		want++ // the function itself
+		if t.TypeName(1) != "function" {
+			return 0, false, errors.New("luau: load a chunk onto the thread before the first resume")
+		}
+	}
+	if nargs < 0 || t.Top() != want {
+		return 0, false, fmt.Errorf("luau: thread stack holds %d values, expected %d", t.Top(), want)
+	}
+	if t.main.depth >= maxResumeDepth {
+		return 0, false, errors.New("luau: too many nested resumes")
+	}
+
+	t.started = true
+	t.main.depth++
+	status := C.bridge_resume(t.State.l, t.main.l, C.int(nargs))
+	t.main.depth--
+
+	switch {
+	case status == 0:
+		return t.Top(), true, nil
+	case status == C.bridge_yieldcode():
+		return t.Top(), false, nil
+	case status == C.bridge_breakcode():
+		C.bridge_settop(t.State.l, 0)
+		return 0, false, errors.New("luau: thread stopped at a breakpoint (not supported)")
+	}
+	C.bridge_tracethread(t.State.l)
+	return 0, false, t.failWith(0, status)
+}
+
+// Runs the thread until it yields, returns or fails.
+//
+// The first call starts the chunk loaded with Load, and args are its
+// arguments. Later calls pass args as the results of the call that yielded.
+// It returns the yielded or returned values, and done = true when the
+// function finished.
+//
+// Values are converted like Get, so a yielded table or function makes Resume
+// return an error (the thread has still advanced). Use ResumeN to read those.
+func (t *Thread) Resume(args ...any) (results []any, done bool, err error) {
+	if t.State.l == nil || t.main.l == nil {
+		return nil, false, errors.New("luau: thread is closed")
+	}
+	base := t.Top()
+	if C.bridge_checkstack(t.State.l, C.int(len(args)+1)) == 0 {
+		return nil, false, errors.New("luau: stack overflow")
+	}
+	for _, a := range args {
+		if err := t.Push(a); err != nil {
+			C.bridge_settop(t.State.l, C.int(base))
+			return nil, false, err
+		}
+	}
+
+	n, done, err := t.ResumeN(len(args))
+	if err != nil {
+		return nil, false, err
+	}
+	results = make([]any, 0, n)
+	for i := 1; i <= n; i++ {
+		v, gerr := t.Get(i)
+		if gerr != nil {
+			C.bridge_settop(t.State.l, 0)
+			return nil, done, gerr
+		}
+		results = append(results, v)
+	}
+	C.bridge_settop(t.State.l, 0)
+	return results, done, nil
 }

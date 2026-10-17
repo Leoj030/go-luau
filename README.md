@@ -6,13 +6,14 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 
 ## Features
 
-- **Self-contained build.** The Luau sources are vendored inside the module, so `go get` and `go build` are all you need. There are no submodules, CMake or system libraries to install.
+- **Self-contained build.** The Luau sources are vendored inside the module, so go get and go build are all you need. There are no submodules, CMake or system libraries to install.
 - **Compile, load and call as separate steps.** Compile once, cache the bytecode, and run it many times with different arguments.
-- **Go functions callable from Luau.** Go errors and panics become ordinary Luau errors.
-- **Tables and references.** Build and read tables from Go, iterate them, and keep Luau values alive from Go with `Ref`.
-- **Userdata.** Hand Go objects to scripts, give them methods through metatables, and get a `Finalize` callback when Luau garbage-collects them.
+- **Go functions callable from Luau.** Go errors and panics become ordinary Luau errors, and a Go function can yield from a coroutine.
+- **Tables and references.** Build and read tables from Go, iterate them, and keep Luau values alive from Go with Ref.
+- **Userdata.** Hand Go objects to scripts, give them methods through metatables, and get a Finalize callback when Luau garbage-collects them.
+- **Coroutines.** Create threads, resume them, read their status, and give each one its own globals.
+- **Sandboxing and limits.** Pick which standard libraries a state opens, cap its memory, lock down its globals with Sandbox, and stop runaway scripts from another goroutine or on a context timeout.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
-- **Sandboxing and limits.** Pick which standard libraries a state opens, cap its memory, lock down its globals with `Sandbox`, and stop runaway scripts from another goroutine or on a `context` timeout.
 
 ## Requirements
 
@@ -76,6 +77,54 @@ func main() {
 
 A larger example covering tables, userdata and error handling is in [`examples/basic`](examples/basic/main.go). Run it with `make example`.
 
+## Running scripts with limits
+
+```go
+L, err := luau.NewStateWith(luau.Options{
+    Libs:        luau.LibBase | luau.LibMath | luau.LibString | luau.LibTable,
+    MemoryLimit: 32 << 20, // bytes
+})
+if err != nil {
+    panic(err)
+}
+defer L.Close()
+
+// Set up everything scripts may use, then lock the globals.
+L.SetGlobal("greeting", "hello")
+L.Sandbox()
+
+// Stop the script if it runs longer than a second.
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+
+stop := L.WatchContext(ctx)
+err = L.DoString(src)
+stop() // call this before reusing or closing the state
+
+switch {
+case errors.Is(err, luau.ErrInterrupted):
+    // timed out
+case errors.Is(err, luau.ErrMemory):
+    // went over MemoryLimit
+}
+```
+
+## Coroutines
+
+```go
+th, _ := L.NewThread()
+defer th.Close() // close threads before the state they came from
+
+bc, _ := luau.Compile(`
+    local a = ...
+    local b = coroutine.yield(a + 1)
+    return "done", b`)
+th.Load(bc, "=co")
+
+res, done, _ := th.Resume(10)  // [11], done = false
+res, done, _ = th.Resume(5)    // ["done", 5], done = true
+```
+
 ## How the API works
 
 The API mirrors Luau's C API, so it is stack-based. Values are pushed onto and read from a stack, and positions are stack indices:
@@ -100,6 +149,7 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 | Userdata      | `PushUserdata`, `ToUserdata`, `SetMetatable`, the `Finalizer` interface                 |
 | Configuration | `NewStateWith(Options{Libs, MemoryLimit})`, `Lib*` flags, `MemoryUsed`                  |
 | Safety        | `Sandbox`, `Interrupt`, `ClearInterrupt`, `WatchContext`, `ErrMemory`, `ErrInterrupted` |
+| Coroutines    | `NewThread`, `Resume`, `ResumeN`, `Status`, `Close`, `SandboxThread`                    |
 
 See the doc comments in [`luau/luau.go`](luau/luau.go) for exact behavior.
 
@@ -124,7 +174,6 @@ What the binding doesn't do yet:
 
 - **`Sandbox` is state-wide.** It makes the globals table read-only for scripts and for the host, so set everything up before calling it. Per-script environments (`luaL_sandboxthread`) will arrive with the coroutine API.
 - **Cancellation is cooperative.** `Interrupt` stops Luau code at safepoints (loops and calls). It can't stop a Go function that blocks.
-- **No coroutine API** (create, resume, yield).
 - **Only nil, bool, number and string convert to Go values.** Reading other types, such as tables, functions, vectors and buffers, with `Get` returns an error. Use the table and reference functions instead.
 - **Table keys are limited** to strings and integers.
 - **Error values are strings.** There are no tracebacks, and non-string error objects aren't preserved.

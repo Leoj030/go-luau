@@ -6,6 +6,7 @@ import (
 	"testing"
 	"context"
 	"time"
+	"reflect"
 
 	"github.com/Leoj030/go-luau/luau"
 )
@@ -230,22 +231,6 @@ func TestCallWithArgsAndBytecodeReuse(t *testing.T) {
 	L2.Load(bc, "=add")
 	if res, _ := L2.Call(5, 6); len(res) != 1 || res[0] != 11.0 {
 		t.Errorf("second state: got %v", res)
-	}
-}
-
-func TestSyntaxErrorReportedByLoad(t *testing.T) {
-	L := newState(t)
-	bc, err := luau.Compile(`local = =`)
-	if err != nil {
-		t.Fatalf("Compile should not fail on syntax errors: %v", err)
-	}
-	err = L.Load(bc, "=mychunk")
-	if err == nil || !strings.Contains(err.Error(), "mychunk") ||
-		!strings.Contains(err.Error(), "Expected identifier") {
-		t.Errorf("got %v, want a parse error mentioning the chunk name", err)
-	}
-	if L.Top() != 0 {
-		t.Errorf("stack not clean after failed Load: %d", L.Top())
 	}
 }
 
@@ -872,4 +857,449 @@ func TestSandbox(t *testing.T) {
 	if L.Top() != 0 {
 		t.Errorf("stack not clean: %d", L.Top())
 	}
+}
+
+func sameValues(got []any, want ...any) bool {
+	if len(got) == 0 && len(want) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(got, want)
+}
+
+func TestThreadYieldsFromLua(t *testing.T) {
+	L := newState(t)
+	th, err := L.NewThread()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer th.Close()
+
+	bc, _ := luau.Compile(`
+		local a = ...
+		local b = coroutine.yield(a + 1)
+		local c = coroutine.yield(b * 2)
+		return "done", c`)
+	if err := th.Load(bc, "=co"); err != nil {
+		t.Fatal(err)
+	}
+	if th.Status() != luau.ThreadSuspended {
+		t.Errorf("status = %v, want suspended", th.Status())
+	}
+
+	res, done, err := th.Resume(10)
+	if err != nil || done || !sameValues(res, 11.0) {
+		t.Fatalf("resume 1: %v, %v, %v", res, done, err)
+	}
+	res, done, err = th.Resume(5)
+	if err != nil || done || !sameValues(res, 10.0) {
+		t.Fatalf("resume 2: %v, %v, %v", res, done, err)
+	}
+	res, done, err = th.Resume("x")
+	if err != nil || !done || !sameValues(res, "done", "x") {
+		t.Fatalf("resume 3: %v, %v, %v", res, done, err)
+	}
+	if th.Status() != luau.ThreadFinished {
+		t.Errorf("status = %v, want finished", th.Status())
+	}
+	if _, _, err := th.Resume(); err == nil {
+		t.Error("resuming a finished thread should fail")
+	}
+}
+
+func TestThreadScriptError(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	bc, _ := luau.Compile(`error("kaboom")`)
+	th.Load(bc, "=co")
+	_, _, err := th.Resume()
+	if err == nil || !strings.Contains(err.Error(), "kaboom") {
+		t.Fatalf("got %v, want the script error", err)
+	}
+	if th.Status() != luau.ThreadFailed {
+		t.Errorf("status = %v, want failed", th.Status())
+	}
+	if _, _, err := th.Resume(); err == nil {
+		t.Error("resuming a failed thread should fail")
+	}
+}
+
+func TestResumeRejectsBadSetup(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	if _, _, err := th.Resume(); err == nil {
+		t.Error("resuming a thread with nothing loaded should fail")
+	}
+	th.Push(5) // not a function
+	if _, _, err := th.ResumeN(0); err == nil {
+		t.Error("resuming without a function should fail")
+	}
+}
+
+func TestGoFunctionYields(t *testing.T) {
+	L := newState(t)
+	L.Register("wait", func(c *luau.State) (int, error) {
+		return c.Yield(1) // hand the first argument to the resumer
+	})
+
+	th, _ := L.NewThread()
+	defer th.Close()
+	bc, _ := luau.Compile(`local got = wait(7) return got, "end"`)
+	th.Load(bc, "=co")
+
+	res, done, err := th.Resume()
+	if err != nil || done || !sameValues(res, 7.0) {
+		t.Fatalf("first resume: %v, %v, %v", res, done, err)
+	}
+	// The resume arguments become the results of wait().
+	res, done, err = th.Resume("back")
+	if err != nil || !done || !sameValues(res, "back", "end") {
+		t.Fatalf("second resume: %v, %v, %v", res, done, err)
+	}
+}
+
+func TestYieldOutsideCoroutineFailsCleanly(t *testing.T) {
+	L := newState(t)
+	L.Register("wait", func(c *luau.State) (int, error) { return c.Yield(0) })
+
+	err := L.DoString(`wait()`)
+	if err == nil || !strings.Contains(err.Error(), "yield") {
+		t.Errorf("got %v, want a yield error", err)
+	}
+	if err := L.DoString(`x = 1`); err != nil {
+		t.Errorf("state unusable afterwards: %v", err)
+	}
+}
+
+func TestYieldMisuse(t *testing.T) {
+	L := newState(t)
+	if _, err := L.Yield(0); err == nil {
+		t.Error("Yield outside a Go function should fail")
+	}
+
+	L.Register("bad", func(c *luau.State) (int, error) {
+		c.Push(1)
+		c.Yield(1)
+		return 0, nil // says yield 1 value, returns 0
+	})
+	err := L.DoString(`bad()`)
+	if err == nil || !strings.Contains(err.Error(), "yielded") {
+		t.Errorf("got %v, want a mismatch error", err)
+	}
+}
+
+func TestResumeNReadsTables(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	bc, _ := luau.Compile(`coroutine.yield({answer = 42}) return 1`)
+	th.Load(bc, "=co")
+
+	n, done, err := th.ResumeN(0)
+	if err != nil || done || n != 1 {
+		t.Fatalf("got %d, %v, %v", n, done, err)
+	}
+	if err := th.GetField(1, "answer"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := th.Get(-1); v != 42.0 {
+		t.Errorf("answer = %v, want 42", v)
+	}
+	th.Pop(th.Top()) // clear the stack before resuming
+
+	n, done, err = th.ResumeN(0)
+	if err != nil || !done || n != 1 {
+		t.Fatalf("got %d, %v, %v", n, done, err)
+	}
+	if v, _ := th.Get(1); v != 1.0 {
+		t.Errorf("result = %v, want 1", v)
+	}
+	th.Pop(1)
+}
+
+func TestThreadSurvivesGC(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	bc, _ := luau.Compile(`coroutine.yield(1) return 2`)
+	th.Load(bc, "=co")
+	if _, done, err := th.Resume(); err != nil || done {
+		t.Fatal("first resume failed")
+	}
+
+	L.GC()
+	L.GC()
+	res, done, err := th.Resume()
+	if err != nil || !done || !sameValues(res, 2.0) {
+		t.Errorf("after GC: %v, %v, %v", res, done, err)
+	}
+}
+
+func TestThreadSandboxIsolation(t *testing.T) {
+	L := newState(t)
+	L.SetGlobal("shared", 10)
+	L.Sandbox()
+
+	bc, _ := luau.Compile(`x = (x or 0) + 1  return x, shared`)
+	run := func() []any {
+		th, err := L.NewThread()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer th.Close()
+		th.SandboxThread()
+		if err := th.Load(bc, "=iso"); err != nil {
+			t.Fatal(err)
+		}
+		res, done, err := th.Resume()
+		if err != nil || !done {
+			t.Fatalf("run: %v, %v", done, err)
+		}
+		return res
+	}
+
+	// Each thread sees its own x, and both can read the shared global.
+	if r := run(); !sameValues(r, 1.0, 10.0) {
+		t.Errorf("first thread: %v", r)
+	}
+	if r := run(); !sameValues(r, 1.0, 10.0) {
+		t.Errorf("second thread: %v (x leaked between threads?)", r)
+	}
+	if v, _ := L.GetGlobal("x"); v != nil {
+		t.Errorf("x leaked into the main state: %v", v)
+	}
+}
+
+func TestInterruptInsideCoroutine(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	bc, _ := luau.Compile(`while true do end`)
+	th.Load(bc, "=spin")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	stop := L.WatchContext(ctx)
+	_, _, err := th.Resume()
+	stop()
+
+	if !errors.Is(err, luau.ErrInterrupted) {
+		t.Errorf("got %v, want ErrInterrupted", err)
+	}
+	if th.Status() != luau.ThreadFailed {
+		t.Errorf("status = %v, want failed", th.Status())
+	}
+}
+
+func TestResumeDepthIsLimited(t *testing.T) {
+	L := newState(t)
+	bc, _ := luau.Compile(`recurse()`)
+	L.Register("recurse", func(c *luau.State) (int, error) {
+		th, err := c.NewThread() // creating threads inside a callback works too
+		if err != nil {
+			return 0, err
+		}
+		defer th.Close()
+		if err := th.Load(bc, "=r"); err != nil {
+			return 0, err
+		}
+		_, _, err = th.Resume()
+		return 0, err
+	})
+	if err := L.DoString(`recurse()`); err == nil {
+		t.Error("unbounded nested resumes should hit the depth limit, not crash")
+	}
+}
+
+func TestSyntaxErrorHasLineAndColumn(t *testing.T) {
+	_, err := luau.Compile("local a = 1\nlocal = =")
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v), want *luau.Error", err, err)
+	}
+	if le.Kind != luau.KindSyntax {
+		t.Errorf("kind = %v, want syntax", le.Kind)
+	}
+	if le.Line != 2 {
+		t.Errorf("line = %d, want 2", le.Line)
+	}
+	if le.Column < 1 {
+		t.Errorf("column = %d, want a position", le.Column)
+	}
+	if !strings.Contains(le.Message, "Expected identifier") {
+		t.Errorf("message = %q", le.Message)
+	}
+	if !strings.HasPrefix(err.Error(), "2:") {
+		t.Errorf("Error() = %q, want it to start with the position", err.Error())
+	}
+	t.Logf("syntax error at %d:%d: %s", le.Line, le.Column, le.Message)
+}
+
+func TestSyntaxErrorThroughDoString(t *testing.T) {
+	L := newState(t)
+	err := L.DoString("x = 1\nlocal = =")
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Kind != luau.KindSyntax || le.Chunk != "dostring" || le.Line != 2 || le.Column < 1 {
+		t.Errorf("got %+v", le)
+	}
+	if L.Top() != 0 {
+		t.Errorf("stack not clean: %d", L.Top())
+	}
+}
+
+func TestLoadReportsErrorBytecode(t *testing.T) {
+	L := newState(t)
+	// Luau encodes a failed compile as bytecode: a 0 byte, then ":line: message".
+	err := L.Load([]byte("\x00:3: oops"), "=mychunk")
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Kind != luau.KindSyntax || le.Chunk != "mychunk" || le.Line != 3 || le.Message != "oops" {
+		t.Errorf("got %+v", le)
+	}
+}
+
+func TestRuntimeErrorFields(t *testing.T) {
+	L := newState(t)
+	err := L.DoString("local function inner()\n\terror(\"boom\")\nend\n\ninner()")
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Kind != luau.KindRuntime || le.Chunk != "dostring" || le.Line != 2 || le.Message != "boom" {
+		t.Errorf("got %+v", le)
+	}
+	if le.Column != 0 {
+		t.Errorf("runtime errors have no column, got %d", le.Column)
+	}
+	if err.Error() != "dostring:2: boom" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if !strings.Contains(le.Traceback, "dostring:2") || strings.Count(le.Traceback, "\n") < 2 {
+		t.Errorf("traceback looks wrong:\n%s", le.Traceback)
+	}
+	t.Logf("traceback:\n%s", le.Traceback)
+}
+
+func TestErrorWithoutPosition(t *testing.T) {
+	L := newState(t)
+	err := L.DoString(`error("plain", 0)`)
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Line != 0 || le.Chunk != "" || le.Message != "plain" {
+		t.Errorf("got %+v", le)
+	}
+}
+
+func TestGoErrorTextIsNotMisreadAsPosition(t *testing.T) {
+	L := newState(t)
+	L.Register("fetch", func(c *luau.State) (int, error) {
+		return 0, errors.New("fetch: 404: not found")
+	})
+	err := L.DoString(`fetch()`)
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Line != 0 || le.Chunk != "" || le.Message != "fetch: 404: not found" {
+		t.Errorf("got %+v", le)
+	}
+}
+
+func TestNonStringErrorValues(t *testing.T) {
+	L := newState(t)
+
+	err := L.DoString(`error({code = 42})`)
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if !le.HasRef || le.Message != "error object is a table value" {
+		t.Fatalf("got %+v", le)
+	}
+	if err := L.PushRef(le.Ref); err != nil {
+		t.Fatal(err)
+	}
+	L.GetField(-1, "code")
+	if v, _ := L.Get(-1); v != 42.0 {
+		t.Errorf("code = %v, want 42", v)
+	}
+	L.Pop(2)
+	L.Unref(le.Ref)
+
+	err = L.DoString(`error(true)`)
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Value != true || le.Message != "true" || le.HasRef {
+		t.Errorf("got %+v", le)
+	}
+	if L.Top() != 0 {
+		t.Errorf("stack not clean: %d", L.Top())
+	}
+}
+
+func TestThreadErrorHasTraceback(t *testing.T) {
+	L := newState(t)
+	th, _ := L.NewThread()
+	defer th.Close()
+
+	bc, _ := luau.Compile("local function inner()\n\terror(\"deep\")\nend\ninner()")
+	th.Load(bc, "=co")
+	_, _, err := th.Resume()
+
+	var le *luau.Error
+	if !errors.As(err, &le) {
+		t.Fatalf("got %T (%v)", err, err)
+	}
+	if le.Message != "deep" || le.Line != 2 || le.Chunk != "co" {
+		t.Errorf("got %+v", le)
+	}
+	if le.Traceback == "" {
+		t.Error("expected a traceback from the failed thread")
+	}
+	t.Logf("traceback:\n%s", le.Traceback)
+}
+
+func TestErrorKinds(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		L, err := luau.NewStateWith(luau.Options{MemoryLimit: 8 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(L.Close)
+
+		err = L.DoString(`local t = {} for i = 1, 1e9 do t[i] = i end`)
+		var le *luau.Error
+		if !errors.As(err, &le) || le.Kind != luau.KindMemory || !errors.Is(err, luau.ErrMemory) {
+			t.Errorf("got %v", err)
+		}
+	})
+
+	t.Run("interrupted", func(t *testing.T) {
+		L := newState(t)
+		go func() {
+			time.Sleep(30 * time.Millisecond)
+			L.Interrupt()
+		}()
+		err := L.DoString(`while true do end`)
+		L.ClearInterrupt()
+
+		var le *luau.Error
+		if !errors.As(err, &le) || le.Kind != luau.KindInterrupted || !errors.Is(err, luau.ErrInterrupted) {
+			t.Errorf("got %v", err)
+		}
+	})
 }

@@ -94,6 +94,24 @@ extern "C" {
     uintptr_t bridge_touserdata(lua_State* L, int idx);   // 0 if not one of ours
     int bridge_setmetatable(lua_State* L, int idx);       // pops a table from the stack
 
+    lua_State* bridge_newthread(lua_State* L, int* ref);   // thread is referenced, not left on the stack
+    int bridge_resume(lua_State* co, lua_State* from, int narg);   // raw Luau status
+    int bridge_yieldcode(void);    // the status lua_resume returns for "yielded"
+    int bridge_breakcode(void);    // ... and for "hit a breakpoint"
+    int bridge_costatus(lua_State* L, lua_State* co);   // 0 running, 1 suspended, 2 normal, 3 finished, 4 failed
+    void bridge_sandboxthread(lua_State* L);
+    
+    // Parses src and reports the first syntax error with its position (1-based).
+    // Returns 1 and a malloc'd message (free it) if there is an error, else 0.
+    int bridge_parseerror(const char* src, size_t len, int* line, int* col, char** msg);
+
+    // Traceback of the last error. Valid until the next error; copy it at once.
+    const char* bridge_traceback(lua_State* L, size_t* len);
+    void bridge_cleartraceback(lua_State* L);
+
+    // Captures the traceback of a thread that has just failed in lua_resume.
+    void bridge_tracethread(lua_State* co);
+
     #ifdef __cplusplus
 }
 

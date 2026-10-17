@@ -1,6 +1,12 @@
 #include <stdlib.h>
 #include <atomic>
 #include <new>
+#include <string>
+#include <string.h>
+
+#include "Luau/Allocator.h"
+#include "Luau/Lexer.h"
+#include "Luau/Parser.h"
 #include "bridge.h"
 #include "lua.h"
 #include "lualib.h"
@@ -20,27 +26,61 @@ static void go_udata_dtor(lua_State* L, void* data) {
 
 // Every Go function is exposed to Luau through this one trampoline.
 // The function's registry ID is stored as upvalue 1.
+//
+// goCallback returns:   n >= 0  -> return n results
+//                       -1      -> raise the error value on top of the stack
+//                       n <= -2 -> yield (-n - 2) values
 static int trampoline(lua_State* L) {
     int id = (int)lua_tonumber(L, lua_upvalueindex(1));
-    int n = goCallback(L, id);   // returns result count, or -1 on error
-    if (n < 0) {
-        // Go has already returned, so throwing here only unwinds C++ frames.
+    int n = goCallback(L, id);
+    if (n == -1) {
+        // Go has already returned, so throwing only unwinds C++ frames.
         if (lua_gettop(L) == 0) lua_pushstring(L, "go function failed");
-        lua_error(L);            // error message is the value on top of the stack
+        lua_error(L);
     }
+    if (n <= -2) return lua_yield(L, -n - 2);   // no exception involved
     return n;
 }
 
 // Per-state host data. It is the allocator's `ud`, and also lives in
 // lua_callbacks(L)->userdata, so callbacks can find it from any thread.
 struct Host {
-    uintptr_t handle;            // cgo.Handle of the Go State
-    size_t used;                 // bytes currently allocated
-    size_t limit;                // 0 = unlimited
+    uintptr_t handle;
+    size_t used;
+    size_t limit;
     std::atomic<int> interrupted;
+    std::string traceback;       // traceback of the last error, filled by pcall_handler
 };
 
 static Host* host_of(lua_State* L) { return (Host*)lua_callbacks(L)->userdata; }
+
+// Appends one line per stack frame, innermost first, starting at firstlevel.
+// It pushes nothing on the Lua stack, so it is safe on a dead coroutine.
+static void build_trace(lua_State* L, int firstlevel, std::string& out) {
+    lua_Debug ar;
+    for (int level = firstlevel; lua_getinfo(L, level, "sln", &ar); ++level) {
+        if (level - firstlevel >= 50) { out += "\n..."; break; }
+        if (!out.empty()) out += "\n";
+        out += ar.short_src ? ar.short_src : "?";
+        if (ar.currentline > 0) { out += ":"; out += std::to_string(ar.currentline); }
+        if (ar.name) { out += " function "; out += ar.name; }
+    }
+}
+
+// Error handler for lua_pcall. Luau calls it with the error value before
+// the stack is unwound, so the traceback shows where the error happened.
+// It returns the error value unchanged.
+static int pcall_handler(lua_State* L) {
+    Host* h = host_of(L);
+    try {
+        h->traceback.clear();
+        build_trace(L, 1, h->traceback);   // level 0 is this handler
+    } catch (const std::bad_alloc&) {
+        h->traceback.clear();
+    }
+    lua_pushvalue(L, 1);
+    return 1;
+}
 
 // Allocator with usage tracking and an optional limit. Returning NULL makes
 // Luau raise an out-of-memory error, which pcall catches.
@@ -163,6 +203,7 @@ extern "C" {
     }
 
     int bridge_load(lua_State* L, const char* chunkname, const char* data, size_t size) {
+        host_of(L)->traceback.clear();
         try {
             return luau_load(L, chunkname, data, size, 0);
         } catch (...) {
@@ -172,11 +213,56 @@ extern "C" {
     }
 
     int bridge_pcall(lua_State* L, int nargs, int nresults) {
+        host_of(L)->traceback.clear();
         try {
-            return lua_pcall(L, nargs, nresults, 0);
+            int funcidx = lua_gettop(L) - nargs;
+            lua_pushcfunction(L, pcall_handler, "traceback");
+            lua_insert(L, funcidx);                        // handler goes below the function
+            int status = lua_pcall(L, nargs, nresults, funcidx);
+            lua_remove(L, funcidx);                        // results (or the error) stay
+            return status;
         } catch (...) {
             lua_pushstring(L, "internal error");
             return LUA_ERRRUN;
+        }
+    }
+
+    int bridge_parseerror(const char* src, size_t len, int* line, int* col, char** msg) {
+        try {
+            Luau::Allocator allocator;
+            Luau::AstNameTable names(allocator);
+            Luau::ParseResult result = Luau::Parser::parse(src, len, names, allocator, Luau::ParseOptions());
+            if (result.errors.empty()) return 0;
+
+            const Luau::ParseError& e = result.errors.front();
+            *line = (int)e.getLocation().begin.line + 1;      // Luau counts from 0
+            *col = (int)e.getLocation().begin.column + 1;
+            const char* text = e.what();
+            size_t n = strlen(text);
+            *msg = (char*)malloc(n + 1);
+            if (!*msg) return 0;
+            memcpy(*msg, text, n + 1);
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    const char* bridge_traceback(lua_State* L, size_t* len) {
+        Host* h = host_of(L);
+        *len = h->traceback.size();
+        return h->traceback.c_str();
+    }
+
+    void bridge_cleartraceback(lua_State* L) { host_of(L)->traceback.clear(); }
+
+    void bridge_tracethread(lua_State* co) {
+        Host* h = host_of(co);
+        try {
+            h->traceback.clear();
+            build_trace(co, 0, h->traceback);
+        } catch (const std::bad_alloc&) {
+            h->traceback.clear();
         }
     }
 
@@ -267,5 +353,44 @@ extern "C" {
 
     int bridge_setmetatable(lua_State* L, int idx) {
         try { return lua_setmetatable(L, idx); } catch (...) { return 0; }
+    }
+
+    lua_State* bridge_newthread(lua_State* L, int* ref) {
+        int top = lua_gettop(L);
+        try {
+            lua_State* co = lua_newthread(L);   // pushes the thread
+            *ref = lua_ref(L, -1);              // pin it in the registry
+            lua_settop(L, top);                 // and take it off the stack
+            return co;
+        } catch (...) {
+            lua_settop(L, top);
+            return nullptr;
+        }
+    }
+
+    int bridge_resume(lua_State* co, lua_State* from, int narg) {
+        try {
+            return lua_resume(co, from, narg);
+        } catch (...) {
+            lua_pushstring(co, "internal error");
+            return LUA_ERRRUN;
+        }
+    }
+
+    int bridge_yieldcode(void) { return LUA_YIELD; }
+    int bridge_breakcode(void) { return LUA_BREAK; }
+
+    int bridge_costatus(lua_State* L, lua_State* co) {
+        switch (lua_costatus(L, co)) {
+            case LUA_CORUN: return 0;
+            case LUA_COSUS: return 1;
+            case LUA_CONOR: return 2;
+            case LUA_COFIN: return 3;
+            default:        return 4;
+        }
+    }
+
+    void bridge_sandboxthread(lua_State* L) {
+        try { luaL_sandboxthread(L); } catch (...) {}
     }
 }
