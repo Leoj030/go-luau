@@ -59,6 +59,9 @@ func NewStateWith(opts Options) (*State, error) {
 	return s, nil
 }
 
+// Close frees the State and everything in it. It is safe to call more than
+// once. Afterwards every method returns ErrClosed (or a zero value, for the
+// ones that return no error), and so does every Thread of this State.
 func (s *State) Close() {
 	if s.parent != nil || s.l == nil {
 		return // call views don't own the state
@@ -74,4 +77,12 @@ func (s *State) Close() {
 
 // GC runs a full garbage collection cycle. Values that are no longer
 // reachable (and have no Ref) are freed, and userdata destructors run.
-func (s *State) GC() { C.bridge_gc(s.l) }
+func (s *State) GC() {
+	if s.open() {
+		C.bridge_gc(s.l)
+	}
+}
+
+// open reports whether s can still be used: s itself has not been closed,
+// and neither has the main State it belongs to.
+func (s *State) open() bool { return s.l != nil && s.root().l != nil }

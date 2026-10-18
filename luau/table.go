@@ -9,12 +9,16 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"unsafe"
 )
 
 // checkTable guards every raw table operation. Luau does not validate
 // types in release builds, so touching a non-table would corrupt memory.
 func (s *State) checkTable(idx int) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	if tn := s.TypeName(idx); tn != "table" {
 		return fmt.Errorf("luau: stack index %d is %s, not a table", idx, tn)
 	}
@@ -24,6 +28,9 @@ func (s *State) checkTable(idx int) error {
 // Pushes a new empty table. narr and nrec are size hints for the
 // array and hash parts (0 is fine).
 func (s *State) NewTable(narr, nrec int) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	if C.bridge_createtable(s.l, C.int(narr), C.int(nrec)) != 0 {
 		return errors.New("luau: failed to create table")
 	}
@@ -47,6 +54,9 @@ func (s *State) GetField(idx int, key string) error {
 // Validates the "table at idx, value on top" layout that the
 // Set* functions use, and returns the table's absolute index.
 func (s *State) checkStore(idx int) (int, error) {
+	if !s.open() {
+		return 0, ErrClosed
+	}
 	top := s.Top()
 	t := s.abs(idx)
 	if top < 2 || t < 1 || t >= top {
@@ -114,6 +124,9 @@ func (s *State) Len(idx int) (int, error) {
 // nothing and returns false. Iteration order is unspecified. Most callers
 // want ForEach instead.
 func (s *State) Next(idx int) (bool, error) {
+	if !s.open() {
+		return false, ErrClosed
+	}
 	if s.Top() < 2 {
 		return false, errors.New("luau: Next needs a table and a key on the stack")
 	}
@@ -158,4 +171,65 @@ func (s *State) ForEach(idx int, fn func() error) error {
 		}
 		s.Pop(1) // drop the value, keep the key for the next step
 	}
+}
+
+// RawGet pops a key and pushes t[key], where t is the table at idx (the
+// table must be below the key). It is raw access, so metamethods are not
+// invoked, and any value can be a key: booleans, numbers, strings, even
+// tables. A missing key gives nil.
+func (s *State) RawGet(idx int) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	top := s.Top()
+	t := s.abs(idx)
+	if top < 2 || t < 1 || t >= top {
+		return errors.New("luau: RawGet needs a table and, above it, a key")
+	}
+	if err := s.checkTable(t); err != nil {
+		return err
+	}
+	if C.bridge_rawget(s.l, C.int(t)) != 0 {
+		C.bridge_settop(s.l, C.int(top-1))
+		return errors.New("luau: failed to read table entry")
+	}
+	return nil
+}
+
+// RawSet does t[key] = value, where t is the table at idx, the key is above
+// it and the value is on top of the stack. It pops the key and the value.
+// It is raw access, so metamethods are not invoked.
+//
+// A nil or NaN key is an error, and so is writing to a frozen table. Once
+// the stack layout checks pass, the key and value are popped even when
+// RawSet fails.
+func (s *State) RawSet(idx int) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	top := s.Top()
+	t := s.abs(idx)
+	if top < 3 || t < 1 || t >= top-1 {
+		return errors.New("luau: RawSet needs a table, a key and a value")
+	}
+	if err := s.checkTable(t); err != nil {
+		return err
+	}
+	fail := func(err error) error {
+		C.bridge_settop(s.l, C.int(top-2)) // pop the key and the value
+		return err
+	}
+	switch s.TypeName(top - 1) {
+	case "nil":
+		return fail(errors.New("luau: a table key can't be nil"))
+	case "number":
+		var ok C.int
+		if math.IsNaN(float64(C.bridge_tonumber(s.l, C.int(top-1), &ok))) {
+			return fail(errors.New("luau: a table key can't be NaN"))
+		}
+	}
+	if C.bridge_rawset(s.l, C.int(t)) != 0 {
+		return fail(errors.New("luau: failed to set table entry (is the table frozen?)"))
+	}
+	return nil
 }

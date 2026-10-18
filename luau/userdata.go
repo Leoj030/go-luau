@@ -23,6 +23,9 @@ type Finalizer interface{ Finalize() }
 // PushUserdata pushes a userdata that holds the Go value v. v stays alive
 // as long as Luau can still reach the userdata.
 func (s *State) PushUserdata(v any) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	h := cgo.NewHandle(v)
 	if C.bridge_pushuserdata(s.l, C.uintptr_t(h)) != 0 {
 		h.Delete()
@@ -52,6 +55,9 @@ func (s *State) ToUserdata(idx int) (any, bool) {
 // Only tables and userdata are accepted: Luau would otherwise apply the
 // metatable to EVERY value of that type (for example all strings).
 func (s *State) SetMetatable(idx int) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	top := s.Top()
 	if top < 2 {
 		return errors.New("luau: SetMetatable needs a target and a metatable on the stack")

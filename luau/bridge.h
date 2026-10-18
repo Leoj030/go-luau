@@ -112,6 +112,9 @@ extern "C" {
     // Captures the traceback of a thread that has just failed in lua_resume.
     void bridge_tracethread(lua_State* co);
 
+    int bridge_rawget(lua_State* L, int idx);   // pops a key, pushes t[key]
+    int bridge_rawset(lua_State* L, int idx);   // pops a key and a value, sets t[key] = value
+
     #ifdef __cplusplus
 }
 

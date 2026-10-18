@@ -17,6 +17,13 @@ var (
 	ErrInterrupted = errors.New("luau: script interrupted")
 	// Returned (wrapped) when a script exceeded the memory limit.
 	ErrMemory = errors.New("luau: memory limit exceeded")
+	// ErrClosed is returned when a method is called on a State that has
+	// been closed, or on a Thread whose State has been closed.
+	ErrClosed = errors.New("luau: state is closed")
+
+	// ErrStackOverflow is returned when a value can't be pushed because
+	// the stack is full. Luau caps the size of the stack.
+	ErrStackOverflow = errors.New("luau: stack overflow")
 )
 
 // ErrorKind says what went wrong.

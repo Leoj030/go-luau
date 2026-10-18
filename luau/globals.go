@@ -42,6 +42,9 @@ func (s *State) SetGlobal(name string, v any) error {
 // Tables, functions and other reference types aren't supported yet and
 // return an error.
 func (s *State) GetGlobal(name string) (any, error) {
+	if !s.open() {
+		return nil, ErrClosed
+	}
 	top := s.Top()
 	defer C.bridge_settop(s.l, C.int(top))
 	cname := C.CString(name)
@@ -55,6 +58,9 @@ func (s *State) GetGlobal(name string) (any, error) {
 // PushGlobal pushes the global called name without converting it, so it
 // works for any type (functions, tables, ...). Pop it when you're done.
 func (s *State) PushGlobal(name string) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
 	if C.bridge_getglobal(s.l, cname) != 0 {
@@ -66,6 +72,9 @@ func (s *State) PushGlobal(name string) error {
 // PopGlobal pops the value on top of the stack and assigns it to the
 // global called name.
 func (s *State) PopGlobal(name string) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	top := s.Top()
 	if top < 1 {
 		return errors.New("luau: PopGlobal needs a value on the stack")

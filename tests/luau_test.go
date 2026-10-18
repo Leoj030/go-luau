@@ -112,13 +112,13 @@ func TestStackIsBalanced(t *testing.T) {
 func TestUnsupportedTypes(t *testing.T) {
 	L := newState(t)
 
-	if err := L.Push(struct{}{}); err == nil {
-		t.Error("Push(struct) should fail")
+	if err := L.Push(make(chan int)); err == nil {
+		t.Error("Push(chan) should fail")
 	}
 
-	L.DoString(`t = {}`)
-	if _, err := L.GetGlobal("t"); err == nil {
-		t.Error("GetGlobal of a table should fail until tables are supported")
+	L.DoString(`f = function() end`)
+	if _, err := L.GetGlobal("f"); err == nil {
+		t.Error("GetGlobal of a function should fail")
 	}
 }
 
@@ -249,21 +249,21 @@ func TestCallErrorsLeaveStackClean(t *testing.T) {
 	// A bad argument type is reported and the function is consumed.
 	bc, _ = luau.Compile(`return 1`)
 	L.Load(bc, "=x")
-	if _, err := L.Call(struct{}{}); err == nil {
+	if _, err := L.Call(make(chan int)); err == nil {
 		t.Error("expected an error for an unsupported argument")
 	}
 	if L.Top() != 0 {
 		t.Errorf("stack not clean after bad arg: %d", L.Top())
 	}
 
-	// A result of an unsupported type (a table) is an error, not a crash.
-	bc, _ = luau.Compile(`return {}`)
-	L.Load(bc, "=t")
+	// A result of an unsupported type (a function) is an error, not a crash.
+	bc, _ = luau.Compile(`return function() end`)
+	L.Load(bc, "=f")
 	if _, err := L.Call(); err == nil {
-		t.Error("expected an error for a table result")
+		t.Error("expected an error for a function result")
 	}
 	if L.Top() != 0 {
-		t.Errorf("stack not clean after table result: %d", L.Top())
+		t.Errorf("stack not clean after function result: %d", L.Top())
 	}
 }
 

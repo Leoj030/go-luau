@@ -54,6 +54,14 @@ struct Host {
 
 static Host* host_of(lua_State* L) { return (Host*)lua_callbacks(L)->userdata; }
 
+// Makes room for n more stack slots before something is pushed. Luau does
+// not check this in release builds, so every function below that pushes
+// calls it first. Returns 0 on success and -1 if the stack can't grow.
+static int reserve(lua_State* L, int n) {
+    try { return lua_checkstack(L, n) ? 0 : -1; }
+    catch (...) { return -1; }
+}
+
 // Appends one line per stack frame, innermost first, starting at firstlevel.
 // It pushes nothing on the Lua stack, so it is safe on a dead coroutine.
 static void build_trace(lua_State* L, int firstlevel, std::string& out) {
@@ -283,9 +291,9 @@ extern "C" {
         return lua_typename(L, lua_type(L, idx));
     }
 
-    int bridge_pushnil(lua_State* L) { lua_pushnil(L); return 0; }
-    int bridge_pushboolean(lua_State* L, int b) { lua_pushboolean(L, b); return 0; }
-    int bridge_pushnumber(lua_State* L, double n) { lua_pushnumber(L, n); return 0; }
+    int bridge_pushnil(lua_State* L) { if (reserve(L, 1)) return -1; lua_pushnil(L); return 0; }
+    int bridge_pushboolean(lua_State* L, int b) { if (reserve(L, 1)) return -1; lua_pushboolean(L, b); return 0; }
+    int bridge_pushnumber(lua_State* L, double n) { if (reserve(L, 1)) return -1; lua_pushnumber(L, n); return 0; }
     int bridge_pushlstring(lua_State* L, const char* s, size_t len) {
         try {
             lua_pushlstring(L, len ? s : "", len);
@@ -323,6 +331,7 @@ extern "C" {
         try { lua_rawseti(L, idx, n); return 0; } catch (...) { return -1; }
     }
     int bridge_next(lua_State* L, int idx) {
+        if (reserve(L, 2)) return -1;   // lua_next pushes a key and a value
         try { return lua_next(L, idx); } catch (...) { return -1; }
     }
     int bridge_objlen(lua_State* L, int idx) { return lua_objlen(L, idx); }
@@ -358,6 +367,7 @@ extern "C" {
     lua_State* bridge_newthread(lua_State* L, int* ref) {
         int top = lua_gettop(L);
         try {
+            if (reserve(L, 1)) return nullptr;
             lua_State* co = lua_newthread(L);   // pushes the thread
             *ref = lua_ref(L, -1);              // pin it in the registry
             lua_settop(L, top);                 // and take it off the stack
@@ -392,5 +402,12 @@ extern "C" {
 
     void bridge_sandboxthread(lua_State* L) {
         try { luaL_sandboxthread(L); } catch (...) {}
+    }
+
+    int bridge_rawget(lua_State* L, int idx) {
+        try { lua_rawget(L, idx); return 0; } catch (...) { return -1; }
+    }
+    int bridge_rawset(lua_State* L, int idx) {
+        try { lua_rawset(L, idx); return 0; } catch (...) { return -1; }
     }
 }

@@ -14,6 +14,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Sandboxing and limits.** Pick which standard libraries a state opens, cap its memory, lock down its globals with `Sandbox`, and stop runaway scripts from another goroutine or on a `context` timeout.
 - **Useful errors.** Failures come back as a typed `*luau.Error` with the kind, chunk, line, a column for syntax errors, a traceback, and the raw error value.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
+- **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
 
 ## Requirements
 
@@ -142,7 +143,7 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 | Lifecycle | `NewState`, `NewStateWith`, `Close`, `GC`, `Top`, `Pop`, `TypeName` |
 | Configuration | `Options{Libs, MemoryLimit}`, the `Lib*` flags, `MemoryUsed` |
 | Running code | `Compile`, `Load`, `Call`, `DoString` |
-| Values | `Push`, `Get` (nil, bool, number, string) |
+| Values | `Push`, `Get` (nil, bool, number, string), `Decode` (structs, slices, maps) |
 | Globals | `SetGlobal`, `GetGlobal`, `PushGlobal`, `PopGlobal` |
 | Tables | `NewTable`, `GetField`, `SetField`, `GetIndex`, `SetIndex`, `Len`, `Next`, `ForEach` |
 | References | `Ref`, `PushRef`, `Unref` |
@@ -187,6 +188,11 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - **Resuming a thread needs a clean stack.** For the first `Resume`, the thread's stack must hold exactly the loaded function. `Resume` converts yielded values like `Get` does, so for tables and other unsupported types use `ResumeN` and read the thread's stack yourself.
 - **Per-thread globals.** For isolated scripts, call `Sandbox` on the main state, then `SandboxThread` on each thread *before* `Load`. Writes then stay private to that thread.
 - **Yielding needs a coroutine.** A Go function that calls `Yield` outside `Thread.Resume` makes the script fail with Luau's yield error. It doesn't crash.
+- **After `Close`, methods return `ErrClosed`.** The ones with no error return give a zero value instead. A `Thread` whose main state has closed behaves the same way.
+- **The stack grows safely.** `Push` and the other functions that add values reserve space first and return `ErrStackOverflow` if the stack is full. `CheckStack(n)` lets you check once before a large batch of pushes.
+- **Structs convert their exported fields.** A `luau:"name"` tag renames a field, `luau:"-"` skips it, and `luau:"name,omitempty"` skips zero values.
+- **`Decode` fills structs, maps and slices from tables.** Fields the table lacks keep their old values, so you can set defaults first, and unknown table keys are ignored.
+- **Converted tables are copies.** To let scripts modify a Go object, use userdata.
 
 ## Limitations
 
@@ -200,9 +206,9 @@ What the binding doesn't do yet:
 - **No column for runtime errors.** This is a limit of Luau's bytecode, not of the binding.
 - **No debugger support.** Breakpoints, `lua_resumeerror`, and the debug hooks aren't wrapped.
 - **A `State` is not safe for concurrent use,** apart from `Interrupt`. Use one goroutine per state, or add your own locking.
-- **Using a `State` or `Thread` after `Close` isn't guarded** yet. Close threads before the state they came from.
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
 - **Linux only so far.** macOS and Windows haven't been tried.
+- **Embedded structs aren’t flattened,** and there are no custom marshalers.
 
 ## License
 

@@ -67,6 +67,9 @@ func syntaxError(csrc *C.char, n int, bc []byte) *Error {
 // with Kind KindSyntax (it has a line but no column, because only Compile
 // can find the column).
 func (s *State) Load(bytecode []byte, chunkname string) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	if len(bytecode) == 0 {
 		return errors.New("luau: empty bytecode")
 	}
@@ -91,6 +94,9 @@ func (s *State) Load(bytecode []byte, chunkname string) error {
 // Results use the same conversions as Get, so a result of an unsupported
 // type (such as a table) returns an error.
 func (s *State) Call(args ...any) ([]any, error) {
+	if !s.open() {
+		return nil, ErrClosed
+	}
 	if s.Top() < 1 {
 		return nil, errors.New("luau: Call needs a function on the stack")
 	}
@@ -98,7 +104,7 @@ func (s *State) Call(args ...any) ([]any, error) {
 
 	if C.bridge_checkstack(s.l, C.int(len(args)+1)) == 0 {
 		C.bridge_settop(s.l, C.int(base))
-		return nil, errors.New("luau: stack overflow")
+		return nil, ErrStackOverflow
 	}
 	for _, a := range args {
 		if err := s.Push(a); err != nil {
@@ -128,6 +134,9 @@ func (s *State) Call(args ...any) ([]any, error) {
 // DoString compiles and runs src, discarding any results. Failures are
 // returned as an *Error, with the chunk named "dostring".
 func (s *State) DoString(src string) error {
+	if !s.open() {
+		return ErrClosed
+	}
 	bc, err := Compile(src)
 	if err != nil {
 		var le *Error
@@ -139,6 +148,10 @@ func (s *State) DoString(src string) error {
 	base := s.Top()
 	if err := s.Load(bc, "=dostring"); err != nil {
 		return err
+	}
+	if C.bridge_checkstack(s.l, 1) == 0 { // room for the error handler
+		C.bridge_settop(s.l, C.int(base))
+		return ErrStackOverflow
 	}
 	if st := C.bridge_pcall(s.l, 0, 0); st != 0 { // 0 results: nothing to convert
 		return s.failWith(base, st)

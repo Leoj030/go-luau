@@ -18,6 +18,7 @@
 //	userdata.go  Go values held by scripts
 //	thread.go    coroutines
 //	sandbox.go   Sandbox, memory use and cancellation
+//	decode.go    reading tables into Go structs, maps and slices
 package luau
 
 /*

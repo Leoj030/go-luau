@@ -56,6 +56,9 @@ type Thread struct {
 
 // Creates a coroutine in the same state. Nothing is left on the stack.
 func (s *State) NewThread() (*Thread, error) {
+	if !s.open() {
+		return nil, ErrClosed
+	}
 	root := s.root()
 	var ref C.int
 	co := C.bridge_newthread(s.l, &ref)
@@ -86,7 +89,7 @@ func (t *Thread) Close() {
 // loaded. For real isolation, call State.Sandbox on the main state first;
 // otherwise scripts can still modify the shared library tables.
 func (t *Thread) SandboxThread() {
-	if t.State.l != nil {
+	if t.State.open() {
 		C.bridge_sandboxthread(t.State.l)
 	}
 }
@@ -117,7 +120,7 @@ func (t *Thread) Status() ThreadStatus {
 // ThreadFailed.
 func (t *Thread) ResumeN(nargs int) (nresults int, done bool, err error) {
 	if t.State.l == nil || t.main.l == nil {
-		return 0, false, errors.New("luau: thread is closed")
+		return 0, false, ErrClosed
 	}
 	switch t.Status() {
 	case ThreadSuspended:
@@ -172,11 +175,11 @@ func (t *Thread) ResumeN(nargs int) (nresults int, done bool, err error) {
 // return an error (the thread has still advanced). Use ResumeN to read those.
 func (t *Thread) Resume(args ...any) (results []any, done bool, err error) {
 	if t.State.l == nil || t.main.l == nil {
-		return nil, false, errors.New("luau: thread is closed")
+		return nil, false, ErrClosed
 	}
 	base := t.Top()
 	if C.bridge_checkstack(t.State.l, C.int(len(args)+1)) == 0 {
-		return nil, false, errors.New("luau: stack overflow")
+		return nil, false, ErrStackOverflow
 	}
 	for _, a := range args {
 		if err := t.Push(a); err != nil {

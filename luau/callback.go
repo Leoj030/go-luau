@@ -20,6 +20,12 @@ type Func func(L *State) (nresults int, err error)
 
 // Pushes a Go function onto the stack as a Luau function.
 func (s *State) PushFunction(name string, fn Func) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if fn == nil {
+		return errors.New("luau: PushFunction needs a function, got nil")
+	}
 	r := s.root()
 	id := r.nextID
 	r.nextID++
