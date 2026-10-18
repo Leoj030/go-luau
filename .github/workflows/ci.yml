@@ -10,7 +10,6 @@ jobs:
     name: ${{ matrix.os }} / Go ${{ matrix.go }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     env:
       GOTOOLCHAIN: local
     strategy:

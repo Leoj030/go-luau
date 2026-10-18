@@ -2,7 +2,7 @@
 
 Go bindings for [Luau](https://luau.org), built with cgo. The binding stays close to Luau's C API and stays out of policy. It has no require, no scheduler, and no opinion on what a script's global API should look like, so you decide what your scripts can see and do.
 
-> **Status: early development.** The API will change. It has only been built and tested on Linux so far. Sandboxing, memory limits and cancellation exist, but they haven't been security-reviewed, so be careful before running untrusted scripts. See [Limitations](#limitations).
+> **Status: early development.** The API will change. It builds and passes its tests on Linux, macOS and Windows. Sandboxing, memory limits and cancellation exist, but they haven't been security-reviewed, so be careful before running untrusted scripts. See [Limitations](#limitations).
 
 ## Features
 
@@ -207,7 +207,6 @@ What the binding doesn't do yet:
 - **No debugger support.** Breakpoints, `lua_resumeerror`, and the debug hooks aren't wrapped.
 - **A `State` is not safe for concurrent use,** apart from `Interrupt`. Use one goroutine per state, or add your own locking.
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
-- **Linux only so far.** macOS and Windows haven't been tried.
 - **Embedded structs aren’t flattened,** and there are no custom marshalers.
 
 ## License
