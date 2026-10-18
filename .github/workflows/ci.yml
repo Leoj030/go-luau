@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Go ${{ matrix.go }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.21', 'stable']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Locate the Go build cache
+        id: gocache
+        shell: bash
+        run: echo "dir=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache compiled Luau
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.gocache.outputs.dir }}
+          key: go-build-${{ runner.os }}-${{ matrix.go }}-${{ hashFiles('luau/core/**', 'luau/include/**', 'luau/bridge.*') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.go }}-
+
+      - name: Check formatting
+        if: runner.os == 'Linux' && matrix.go == 'stable'
+        run: |
+          files=$(gofmt -l luau tests examples)
+          if [ -n "$files" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./tests/... -count=1
+
+      - name: Test with the race detector
+        if: runner.os != 'Windows'
+        run: go test ./tests/... -race -count=1
