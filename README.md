@@ -1,4 +1,4 @@
-# go-luau
+# go-luau [![CI](https://github.com/Leoj030/go-luau/actions/workflows/ci.yml/badge.svg)](https://github.com/Leoj030/go-luau/actions/workflows/ci.yml)
 
 Go bindings for [Luau](https://luau.org), built with cgo. The binding stays close to Luau's C API and stays out of policy. It has no require, no scheduler, and no opinion on what a script's global API should look like, so you decide what your scripts can see and do.
 
