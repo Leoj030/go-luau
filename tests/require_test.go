@@ -110,6 +110,79 @@ func TestRequireAliases(t *testing.T) {
 	}
 }
 
+func TestRegisterModule(t *testing.T) {
+	L := newState(t)
+	if err := L.OpenRequire(luau.FSRequirer(fstest.MapFS{})); err != nil {
+		t.Fatal(err)
+	}
+	if err := L.Push("preserved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := L.RegisterModule("@std/json", map[string]luau.Func{
+		"encode": func(c *luau.State) (int, error) {
+			value, err := c.Get(1)
+			if err != nil {
+				return 0, err
+			}
+			text, ok := value.(string)
+			if !ok {
+				return 0, errors.New("encode: expected a string")
+			}
+			if err := c.Push("encoded:" + text); err != nil {
+				return 0, err
+			}
+			return 1, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := L.Get(-1); err != nil || got != "preserved" {
+		t.Fatalf("stack value after module registration = %v, %v; want preserved", got, err)
+	}
+	if err := L.Pop(1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := L.DoString(`
+		local json = require("@std/json")
+		result = json.encode("value")
+		sameModule = json == require("@STD/JSON")
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := L.GetGlobal("result"); got != "encoded:value" {
+		t.Errorf("encode result = %v, want %q", got, "encoded:value")
+	}
+	if got, _ := L.GetGlobal("sameModule"); got != true {
+		t.Errorf("case-insensitive module registration = %v, want true", got)
+	}
+	if L.Top() != 0 {
+		t.Errorf("stack not clean: %d", L.Top())
+	}
+}
+
+func TestRegisterModuleValidation(t *testing.T) {
+	L := newState(t)
+	if err := L.Push("preserved"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path  string
+		funcs map[string]luau.Func
+	}{
+		{"std/json", nil},
+		{"@std/json", map[string]luau.Func{"nil": nil}},
+		{"@std/json", map[string]luau.Func{"bad\x00name": func(*luau.State) (int, error) { return 0, nil }}},
+	} {
+		if err := L.RegisterModule(tc.path, tc.funcs); err == nil {
+			t.Errorf("RegisterModule(%q, %v) succeeded, want an error", tc.path, tc.funcs)
+		}
+		if L.Top() != 1 {
+			t.Errorf("stack height after invalid registration = %d, want 1", L.Top())
+		}
+	}
+}
+
 func TestRequireErrors(t *testing.T) {
 	for _, c := range []struct {
 		name  string

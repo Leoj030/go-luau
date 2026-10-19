@@ -123,6 +123,8 @@ extern "C" {
     // Opens Luau's require library (the global `require`). handle identifies the
     // Go Requirer that answers its questions. Returns 0 on success.
     int bridge_openrequire(lua_State* L, uintptr_t handle);
+    // Registers the table at table_idx behind the path at path_idx.
+    int bridge_registermodule(lua_State* L, int path_idx, int table_idx);
 
     #ifdef __cplusplus
 }

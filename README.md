@@ -15,7 +15,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Useful errors.** Failures come back as a typed `*luau.Error` with the kind, chunk, line, a column for syntax errors, a traceback, and the raw error value.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
 - **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
-- **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`.
+- **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`. `RegisterModule` provides Go functions as a table at a path.
 
 ## Requirements
 
@@ -153,7 +153,7 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 | Coroutines | `NewThread`, `Thread.Resume`, `Thread.ResumeN`, `Thread.Status`, `Thread.SandboxThread`, `Thread.Close` |
 | Safety | `Sandbox`, `Interrupt`, `ClearInterrupt`, `WatchContext`, `ErrMemory`, `ErrInterrupted` |
 | Errors | `*Error`, `ErrorKind` (`KindSyntax`, `KindRuntime`, `KindMemory`, `KindInterrupted`) |
-| Require | `OpenRequire`, `Requirer`, `FSRequirer` |
+| Require | `OpenRequire`, `RegisterModule`, `Requirer`, `FSRequirer` |
 
 A `Thread` embeds `*State`, so `Load`, `Push`, `Get`, `SetGlobal` and the rest work on the thread's own stack.
 
@@ -185,7 +185,7 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - **Invalid stack indices return errors**, not crashes. Luau itself is unsafe to query out of range, so the binding checks in Go first.
 - **Default libraries.** A zero-value `Options` opens what `luaL_openlibs` opens (`LibDefault`). `LibAll` additionally enables `class` and `integer`, and `LibNone` opens nothing, not even `print`.
 - **Memory limits are in bytes** and count everything the state allocates. Hitting the limit fails the running script with an error wrapping `ErrMemory`, and the state stays usable after a `GC()`.
-- **`Sandbox` comes last.** It makes the globals table read-only for scripts *and* for the host, so call `SetGlobal`, `Register` and the like first.
+- **`Sandbox` comes last.** It makes the globals table read-only for scripts *and* for the host, so call `SetGlobal`, `Register`, `RegisterModule` and the like first.
 - **Call `Interrupt` only on a live state.** `WatchContext` handles this for you: call its returned `stop` function before `Close`.
 - **Resuming a thread needs a clean stack.** For the first `Resume`, the thread's stack must hold exactly the loaded function. `Resume` converts yielded values like `Get` does, so for tables and other unsupported types use `ResumeN` and read the thread's stack yourself.
 - **Per-thread globals.** For isolated scripts, call `Sandbox` on the main state, then `SandboxThread` on each thread *before* `Load`. Writes then stay private to that thread.
@@ -213,7 +213,7 @@ What the binding doesn't do yet:
 - **A `State` is not safe for concurrent use,** apart from `Interrupt`. Use one goroutine per state, or add your own locking.
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
 - **Embedded structs aren’t flattened,** and there are no custom marshalers.
-- **require doesn’t yet support registering built-in modules,** clearing the cache, or cyclic requires with export.
+- **require doesn’t yet support** clearing the cache or cyclic requires with export.
 
 ## License
 

@@ -176,4 +176,28 @@ extern "C" {
             return 0;
         } catch (...) { return -1; }
     }
+
+    int bridge_registermodule(lua_State* L, int path_idx, int table_idx) {
+        int top = lua_gettop(L);
+        lua_State* T = nullptr;
+        try {
+            if (!lua_checkstack(L, 3)) return -1;
+            T = lua_newthread(L);
+            if (!T || !lua_checkstack(T, 2)) {
+                lua_settop(L, top);
+                return -1;
+            }
+            lua_pushvalue(L, path_idx);
+            lua_pushvalue(L, table_idx);
+            lua_xmove(L, T, 2);
+            luarequire_registermodule(T);
+            lua_settop(T, 0);
+            lua_settop(L, top);
+            return 0;
+        } catch (...) {
+            if (T) lua_settop(T, 0);
+            lua_settop(L, top);
+            return -1;
+        }
+    }
 }
