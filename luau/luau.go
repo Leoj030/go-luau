@@ -6,19 +6,22 @@
 //
 // The files in this package are grouped by topic:
 //
-//	state.go     creating and closing a State
-//	options.go   Options and the standard library flags
-//	stack.go     the stack: Top, Pop, Push, Get, TypeName
-//	run.go       Compile, Load, Call, DoString
-//	errors.go    the Error type and how errors are built
-//	globals.go   SetGlobal, GetGlobal, PushGlobal, PopGlobal
-//	table.go     tables
-//	ref.go       references that keep values alive from Go
-//	callback.go  Go functions callable from Luau, and Yield
-//	userdata.go  Go values held by scripts
-//	thread.go    coroutines
-//	sandbox.go   Sandbox, memory use and cancellation
-//	decode.go    reading tables into Go structs, maps and slices
+//	state.go     		  creating and closing a State
+//	options.go   		  Options and the standard library flags
+//	stack.go     		  the stack: Top, Pop, Push, Get, TypeName
+//	run.go       		  Compile, Load, Call, DoString
+//	errors.go    		  the Error type and how errors are built
+//	globals.go   		  SetGlobal, GetGlobal, PushGlobal, PopGlobal
+//	table.go     		  tables
+//	ref.go       		  references that keep values alive from Go
+//	callback.go  		  Go functions callable from Luau, and Yield
+//	userdata.go    		  Go values held by scripts
+//	thread.go    		  coroutines
+//	sandbox.go   		  Sandbox, memory use and cancellation
+//	decode.go			  reading tables into Go structs, maps and slices
+//	require.go            require-by-string: the Requirer interface and OpenRequire
+//	require_callbacks.go  the callbacks Luau's require makes into Go
+//	require_fs.go         a Requirer that serves modules from an fs.FS
 package luau
 
 /*

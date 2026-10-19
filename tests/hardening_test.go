@@ -3,6 +3,7 @@ package tests
 import (
 	"errors"
 	"testing"
+	"testing/fstest"
 
 	"github.com/Leoj030/go-luau/luau"
 )
@@ -46,6 +47,7 @@ func TestUseAfterCloseReturnsErrClosed(t *testing.T) {
 		"RawGet":       func() error { return L.RawGet(-2) },
 		"RawSet":       func() error { return L.RawSet(-3) },
 		"Decode":       func() error { var x int; return L.Decode(1, &x) },
+		"OpenRequire":  func() error { return L.OpenRequire(luau.FSRequirer(fstest.MapFS{})) },
 	}
 	for name, call := range calls {
 		if err := call(); !errors.Is(err, luau.ErrClosed) {

@@ -21,10 +21,11 @@ type State struct {
 	yieldN   int
 	depth    int // nested Resume depth (main state only)
 
-	handle cgo.Handle
-	funcs  map[int]Func
-	nextID int
-	names  []*C.char // debug names; Luau keeps these pointers, so they live until Close
+	handle    cgo.Handle
+	funcs     map[int]Func
+	nextID    int
+	names     []*C.char  // debug names; Luau keeps these pointers, so they live until Close
+	reqHandle cgo.Handle // the Requirer behind require, if OpenRequire was called
 }
 
 // Returns the state that owns the Go function registry: the main
@@ -69,6 +70,10 @@ func (s *State) Close() {
 	C.bridge_close(s.l)
 	s.l = nil
 	s.handle.Delete()
+	if s.reqHandle != 0 {
+		s.reqHandle.Delete()
+		s.reqHandle = 0
+	}
 	for _, n := range s.names {
 		C.free(unsafe.Pointer(n))
 	}

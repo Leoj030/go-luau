@@ -115,6 +115,15 @@ extern "C" {
     int bridge_rawget(lua_State* L, int idx);   // pops a key, pushes t[key]
     int bridge_rawset(lua_State* L, int idx);   // pops a key and a value, sets t[key] = value
 
+    // Results of the require callbacks. The values match Luau's own enums, which
+    // bridge_require.cpp checks at compile time.
+    enum { BRIDGE_NAV_SUCCESS = 0, BRIDGE_NAV_AMBIGUOUS = 1, BRIDGE_NAV_NOT_FOUND = 2 };
+    enum { BRIDGE_CFG_ABSENT = 0, BRIDGE_CFG_AMBIGUOUS = 1, BRIDGE_CFG_JSON = 2, BRIDGE_CFG_LUAU = 3 };
+
+    // Opens Luau's require library (the global `require`). handle identifies the
+    // Go Requirer that answers its questions. Returns 0 on success.
+    int bridge_openrequire(lua_State* L, uintptr_t handle);
+
     #ifdef __cplusplus
 }
 

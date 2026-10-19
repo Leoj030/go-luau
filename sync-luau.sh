@@ -9,10 +9,10 @@ rm -f $DST/*.cpp $DST/*.h
 find luau -maxdepth 1 \( -name '*.cpp' -o -name '*.h' \) ! -name 'bridge.*' -delete
 rm -rf luau/include && mkdir -p luau/include
 
-find $SRC/VM/src $SRC/Common/src $SRC/Bytecode/src $SRC/Ast/src $SRC/Compiler/src \
+find $SRC/VM/src $SRC/Common/src $SRC/Bytecode/src $SRC/Ast/src $SRC/Compiler/src $SRC/Config/src $SRC/Require/src \
   \( -name '*.cpp' -o -name '*.h' \) -exec cp {} $DST/ \;
 
-for d in Common VM Bytecode Ast Compiler; do
+for d in Common VM Bytecode Ast Compiler Config Require; do
   cp -r $SRC/$d/include/. luau/include/
 done
 

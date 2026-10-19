@@ -1,6 +1,6 @@
 # go-luau [![CI](https://github.com/Leoj030/go-luau/actions/workflows/ci.yml/badge.svg)](https://github.com/Leoj030/go-luau/actions/workflows/ci.yml)
 
-Go bindings for [Luau](https://luau.org), built with cgo. The binding stays close to Luau's C API and stays out of policy. It has no require, no scheduler, and no opinion on what a script's global API should look like, so you decide what your scripts can see and do.
+Go bindings for [Luau](https://luau.org), built with cgo. The binding stays close to Luau's C API and stays out of policy. It has no scheduler, and no opinion on what a script's global API should look like, so you decide what your scripts can see and do.
 
 > **Status: early development.** The API will change. It builds and passes its tests on Linux, macOS and Windows. Sandboxing, memory limits and cancellation exist, but they haven't been security-reviewed, so be careful before running untrusted scripts. See [Limitations](#limitations).
 
@@ -15,6 +15,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Useful errors.** Failures come back as a typed `*luau.Error` with the kind, chunk, line, a column for syntax errors, a traceback, and the raw error value.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
 - **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
+- **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`.
 
 ## Requirements
 
@@ -28,7 +29,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 go get github.com/Leoj030/go-luau
 ```
 
-The first build compiles around 75 C++ files and takes a while (roughly 15 seconds on a multi-core machine). The Luau sources live in their own package, so Go caches them and later builds only recompile your code.
+The first build compiles around 75 C++ files and takes a while (roughly 15 seconds on a multi-core machine or longer). The Luau sources live in their own package, so Go caches them and later builds only recompile your code.
 
 ## Quick start
 
@@ -152,6 +153,7 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 | Coroutines | `NewThread`, `Thread.Resume`, `Thread.ResumeN`, `Thread.Status`, `Thread.SandboxThread`, `Thread.Close` |
 | Safety | `Sandbox`, `Interrupt`, `ClearInterrupt`, `WatchContext`, `ErrMemory`, `ErrInterrupted` |
 | Errors | `*Error`, `ErrorKind` (`KindSyntax`, `KindRuntime`, `KindMemory`, `KindInterrupted`) |
+| Require | `OpenRequire`, `Requirer`, `FSRequirer` |
 
 A `Thread` embeds `*State`, so `Load`, `Push`, `Get`, `SetGlobal` and the rest work on the thread's own stack.
 
@@ -193,6 +195,9 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - **Structs convert their exported fields.** A `luau:"name"` tag renames a field, `luau:"-"` skips it, and `luau:"name,omitempty"` skips zero values.
 - **`Decode` fills structs, maps and slices from tables.** Fields the table lacks keep their old values, so you can set defaults first, and unknown table keys are ignored.
 - **Converted tables are copies.** To let scripts modify a Go object, use userdata.
+- Call `OpenRequire` before Sandbox.
+- `FSRequirer` resolves a script’s `require` relative to its chunk name: `@dir/x.luau` must exist in the file system, and a `=name` chunk resolves from the root.
+- `os.DirFS` follows symbolic links, so a link can point outside the directory.
 
 ## Limitations
 
@@ -208,6 +213,7 @@ What the binding doesn't do yet:
 - **A `State` is not safe for concurrent use,** apart from `Interrupt`. Use one goroutine per state, or add your own locking.
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
 - **Embedded structs aren’t flattened,** and there are no custom marshalers.
+- **require doesn’t yet support registering built-in modules,** clearing the cache, or cyclic requires with export.
 
 ## License
 
