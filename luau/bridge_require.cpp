@@ -200,4 +200,35 @@ extern "C" {
             return -1;
         }
     }
+
+    // Both run Luau's own C functions through lua_pcall, so an error becomes
+    // a status code and the caller's stack is always put back.
+    int bridge_clearrequirecache(lua_State* L) {
+        int top = lua_gettop(L);
+        try {
+            if (!lua_checkstack(L, 2)) return -1;
+            lua_pushcfunction(L, luarequire_clearcache, "clearcache");
+            int status = lua_pcall(L, 0, 0, 0);
+            lua_settop(L, top);
+            return status == 0 ? 0 : -1;
+        } catch (...) {
+            lua_settop(L, top);
+            return -1;
+        }
+    }
+
+    int bridge_clearrequirecacheentry(lua_State* L, const char* key, size_t len) {
+        int top = lua_gettop(L);
+        try {
+            if (!lua_checkstack(L, 3)) return -1;
+            lua_pushcfunction(L, luarequire_clearcacheentry, "clearcacheentry");
+            lua_pushlstring(L, len ? key : "", len);
+            int status = lua_pcall(L, 1, 0, 0);
+            lua_settop(L, top);
+            return status == 0 ? 0 : -1;
+        } catch (...) {
+            lua_settop(L, top);
+            return -1;
+        }
+    }
 }

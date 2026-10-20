@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"runtime/cgo"
 	"strings"
+	"unsafe"
 )
 
 // NavResult is a Requirer's answer to a navigation request.
@@ -207,6 +208,46 @@ func (s *State) RegisterModule(path string, functions map[string]Func) error {
 	if err := s.RegisterModuleTable(path); err != nil {
 		s.restore(base)
 		return err
+	}
+	return nil
+}
+
+// ClearRequireCache forgets every module that require has loaded, so the
+// next require of each one runs its file again. Modules registered with
+// RegisterModule stay registered.
+//
+// It only affects future requires. A script that already holds a module
+// keeps using that copy, a module that required another keeps the copy it
+// got, and whatever a module did when it ran (such as registering a
+// callback) is not undone. For a real reload, clear everything.
+func (s *State) ClearRequireCache() error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if C.bridge_clearrequirecache(s.l) != 0 {
+		return errors.New("luau: failed to clear the require cache")
+	}
+	return nil
+}
+
+// ClearRequireCacheEntry forgets one loaded module, so the next require of
+// it runs it again. cacheKey is the key the Requirer reported for the module
+// in ModuleInfo.CacheKey. For FSRequirer that is the path inside the file
+// system, such as "lib/util.luau". An unknown key does nothing. The same
+// limits apply as for ClearRequireCache.
+func (s *State) ClearRequireCacheEntry(cacheKey string) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if strings.ContainsRune(cacheKey, '\x00') {
+		return errors.New("luau: a cache key can't contain NUL bytes")
+	}
+	var p *C.char
+	if len(cacheKey) > 0 {
+		p = (*C.char)(unsafe.Pointer(unsafe.StringData(cacheKey)))
+	}
+	if C.bridge_clearrequirecacheentry(s.l, p, C.size_t(len(cacheKey))) != 0 {
+		return errors.New("luau: failed to clear the require cache entry")
 	}
 	return nil
 }

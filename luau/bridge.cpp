@@ -378,6 +378,23 @@ extern "C" {
         }
     }
 
+    int bridge_pinthread(lua_State* L, int* ref) {
+        int top = lua_gettop(L);
+        try {
+            if (reserve(L, 1)) return -1;
+            if (lua_pushthread(L)) {   // returns 1 for the main thread
+                lua_settop(L, top);
+                return 1;
+            }
+            *ref = lua_ref(L, -1);
+            lua_settop(L, top);
+            return 0;
+        } catch (...) {
+            lua_settop(L, top);
+            return -1;
+        }
+    }
+
     int bridge_resume(lua_State* co, lua_State* from, int narg) {
         try {
             return lua_resume(co, from, narg);

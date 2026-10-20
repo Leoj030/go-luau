@@ -204,3 +204,49 @@ func (t *Thread) Resume(args ...any) (results []any, done bool, err error) {
 	C.bridge_settop(t.State.l, 0)
 	return results, done, nil
 }
+
+// Thread returns a handle to the coroutine this Go function was called
+// from, so the runtime can resume it later. It is the building block for
+// asynchronous functions. A function like fetch calls Thread, starts its
+// work on another goroutine, and returns Yield(0). When the work is done,
+// the goroutine hands the result to the goroutine that owns the State, which
+// calls Resume on the handle with that result. The values passed to Resume
+// become the results of the call that yielded.
+//
+// The rules:
+//
+//   - Thread can only be called from a Go function that is running inside a
+//     coroutine, which means under Thread.Resume or ResumeN. From the main
+//     thread (a plain DoString or Call) it returns an error.
+//   - The handle pins the coroutine. Close it when you are done: until then
+//     the coroutine can't be garbage-collected, even if nothing resumes it.
+//   - A State belongs to one goroutine. The goroutine doing the work must not
+//     touch the handle or the State, so it should send its result over a
+//     channel to the owner.
+//   - It is meant for coroutines your runtime resumes itself, such as those
+//     made with NewThread. A coroutine that a script resumes with
+//     coroutine.resume gets its yielded values in the script, and resuming
+//     it from Go as well mixes two resumers.
+func (s *State) Thread() (*Thread, error) {
+	if !s.open() {
+		return nil, ErrClosed
+	}
+	if !s.call {
+		return nil, errors.New("luau: Thread can only be called from a Go function")
+	}
+	var ref C.int
+	switch C.bridge_pinthread(s.l, &ref) {
+	case 0:
+	case 1:
+		return nil, errors.New("luau: Thread needs a coroutine, but this Go function was called from the main thread")
+	default:
+		return nil, errors.New("luau: failed to pin the running coroutine")
+	}
+	root := s.root()
+	return &Thread{
+		State:   &State{l: s.l, parent: root},
+		main:    root,
+		ref:     Ref(ref),
+		started: true, // it is already running, so Resume continues it
+	}, nil
+}

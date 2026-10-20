@@ -128,6 +128,13 @@ extern "C" {
 
     void bridge_setreadonly(lua_State* L, int idx, int enabled);
 
+    // Pins the running coroutine in the registry. Returns 0 and a reference on
+    // success, 1 if L is the main thread (nothing is pinned), -1 on failure.
+    int bridge_pinthread(lua_State* L, int* ref);
+
+    int bridge_clearrequirecache(lua_State* L);
+    int bridge_clearrequirecacheentry(lua_State* L, const char* key, size_t len);
+
     #ifdef __cplusplus
 }
 

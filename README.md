@@ -16,6 +16,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
 - **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
 - **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`. `RegisterModule` and `RegisterModuleTable` expose Go code as require-able modules, with any value in them.
+- **Async building blocks.** A Go function can suspend its coroutine with `Yield` and get a `Thread()` handle to resume it later, so runtimes can build task, fetch and similar themselves.
 
 ## Requirements
 
@@ -150,10 +151,10 @@ Inside a function registered from Go, the arguments are at indices `1..Top()`, a
 | References | `Ref`, `PushRef`, `Unref` |
 | Go functions | `Register`, `PushFunction`, `Yield` |
 | Userdata | `PushUserdata`, `ToUserdata`, `SetMetatable`, the `Finalizer` interface |
-| Coroutines | `NewThread`, `Thread.Resume`, `Thread.ResumeN`, `Thread.Status`, `Thread.SandboxThread`, `Thread.Close` |
+| Coroutines | `NewThread`, `Thread`, `Thread.Resume`, `Thread.ResumeN`, `Thread.Status`, `Thread.SandboxThread`, `Thread.Close` |
 | Safety | `Sandbox`, `Interrupt`, `ClearInterrupt`, `WatchContext`, `ErrMemory`, `ErrInterrupted` |
 | Errors | `*Error`, `ErrorKind` (`KindSyntax`, `KindRuntime`, `KindMemory`, `KindInterrupted`) |
-| Require | `OpenRequire`, `RegisterModule`, `Requirer`, `FSRequirer` |
+| Require | `OpenRequire`, `RegisterModule`, `Requirer`, `FSRequirer`, `ClearRequireCache`, `ClearRequireCacheEntry` |
 
 A `Thread` embeds `*State`, so `Load`, `Push`, `Get`, `SetGlobal` and the rest work on the thread's own stack.
 
@@ -201,6 +202,8 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - A registered module wins over a file with the same path, so a `.luau` stub can describe it for type checkers.
 - Registered module tables are frozen. Tables inside them are not, so call `Freeze` on those if scripts shouldn’t modify them.
 - Module paths are case-insensitive.
+- **For async work:** call `c.Thread()`, start the work on another goroutine, and return `c.Yield(0)`. When the work finishes, send the result to the goroutine that owns the `State` and call `Resume` on the handle there. Never touch a `State` or `Thread` from the worker goroutine, and `Close` the handle when you are done.
+- **Clearing the require cache only affects future requires.** Scripts that already hold a module keep their copy.
 
 ## Limitations
 
@@ -217,6 +220,7 @@ What the binding doesn't do yet:
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
 - **Embedded structs aren’t flattened,** and there are no custom marshalers.
 - **require doesn’t yet support** clearing the cache or cyclic requires with export.
+- A module can’t yield while it loads.
 
 ## License
 
