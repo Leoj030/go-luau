@@ -233,3 +233,15 @@ func (s *State) RawSet(idx int) error {
 	}
 	return nil
 }
+
+// Freeze makes the table at idx read-only, like table.freeze in Luau:
+// afterwards any change to it, from a script or from RawSet, fails. It only
+// freezes that table. Tables inside it stay writable unless you freeze them
+// too, and the binding has no way to undo it.
+func (s *State) Freeze(idx int) error {
+	if err := s.checkTable(idx); err != nil {
+		return err
+	}
+	C.bridge_setreadonly(s.l, C.int(s.abs(idx)), 1)
+	return nil
+}

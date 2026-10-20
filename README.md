@@ -15,7 +15,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Useful errors.** Failures come back as a typed `*luau.Error` with the kind, chunk, line, a column for syntax errors, a traceback, and the raw error value.
 - **Exception-safe.** Luau reports errors with C++ exceptions. Every call into Luau is guarded so an exception never unwinds through Go frames.
 - **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
-- **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`. `RegisterModule` provides Go functions as a table at a path.
+- **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`. `RegisterModule` and `RegisterModuleTable` expose Go code as require-able modules, with any value in them.
 
 ## Requirements
 
@@ -198,6 +198,9 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - Call `OpenRequire` before Sandbox.
 - `FSRequirer` resolves a script’s `require` relative to its chunk name: `@dir/x.luau` must exist in the file system, and a `=name` chunk resolves from the root.
 - `os.DirFS` follows symbolic links, so a link can point outside the directory.
+- A registered module wins over a file with the same path, so a `.luau` stub can describe it for type checkers.
+- Registered module tables are frozen. Tables inside them are not, so call `Freeze` on those if scripts shouldn’t modify them.
+- Module paths are case-insensitive.
 
 ## Limitations
 

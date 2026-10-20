@@ -410,4 +410,8 @@ extern "C" {
     int bridge_rawset(lua_State* L, int idx) {
         try { lua_rawset(L, idx); return 0; } catch (...) { return -1; }
     }
+
+    void bridge_setreadonly(lua_State* L, int idx, int enabled) {
+        lua_setreadonly(L, idx, enabled);
+    }
 }

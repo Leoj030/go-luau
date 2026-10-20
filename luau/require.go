@@ -7,7 +7,9 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"runtime/cgo"
+	"strings"
 )
 
 // NavResult is a Requirer's answer to a navigation request.
@@ -122,5 +124,89 @@ func (s *State) OpenRequire(r Requirer) error {
 		return errors.New("luau: failed to open require (is the State already sandboxed?)")
 	}
 	s.reqHandle = h
+	return nil
+}
+
+// RegisterModuleTable pops the table on top of the stack and registers it as
+// the module that require(path) returns. Unlike RegisterModule, the table
+// can hold anything: functions, constants, nested tables.
+//
+// The path must begin with "@", such as "@std/process". Paths are matched
+// without regard to case, and a registered module wins over a file at the
+// same path, so a .luau stub for type checkers can sit beside it.
+//
+// Once registered, the module table is frozen, so no script can replace
+// what other scripts will see. Tables inside it stay as they are, so freeze
+// them with Freeze if scripts shouldn't change them. The values are a copy
+// taken now: for something that should stay current, such as a clock, put a
+// function in the module.
+//
+// If the path or the stack is invalid, nothing changes. Otherwise the table
+// is popped, whether or not registration succeeds. Call OpenRequire so that
+// scripts can use the module.
+func (s *State) RegisterModuleTable(path string) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if !strings.HasPrefix(path, "@") || strings.ContainsRune(path, '\x00') {
+		return errors.New("luau: RegisterModuleTable path must begin with @ and contain no NUL bytes")
+	}
+	top := s.Top()
+	if top < 1 {
+		return errors.New("luau: RegisterModuleTable needs a table on the stack")
+	}
+	if err := s.checkTable(-1); err != nil {
+		return err
+	}
+
+	// From here on the table is consumed.
+	defer s.restore(top - 1)
+	if err := s.Push(path); err != nil {
+		return err
+	}
+	if C.bridge_registermodule(s.l, C.int(top+1), C.int(top)) != 0 {
+		return fmt.Errorf("luau: failed to register module %q", path)
+	}
+	C.bridge_setreadonly(s.l, C.int(top), 1) // after registering, in case registration writes to the table
+	return nil
+}
+
+// RegisterModule exposes Go functions as the module that require(path)
+// returns. It is the short form of RegisterModuleTable for a module that is
+// only functions, and it follows the same rules.
+func (s *State) RegisterModule(path string, functions map[string]Func) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if !strings.HasPrefix(path, "@") || strings.ContainsRune(path, '\x00') {
+		return errors.New("luau: RegisterModule path must begin with @ and contain no NUL bytes")
+	}
+	for name, fn := range functions {
+		if strings.ContainsRune(name, '\x00') {
+			return fmt.Errorf("luau: RegisterModule function name %q contains a NUL byte", name)
+		}
+		if fn == nil {
+			return fmt.Errorf("luau: RegisterModule function %q is nil", name)
+		}
+	}
+
+	base := s.Top()
+	if err := s.NewTable(0, len(functions)); err != nil {
+		return err
+	}
+	for name, fn := range functions {
+		if err := s.PushFunction(name, fn); err != nil {
+			s.restore(base)
+			return err
+		}
+		if err := s.SetField(-2, name); err != nil {
+			s.restore(base)
+			return err
+		}
+	}
+	if err := s.RegisterModuleTable(path); err != nil {
+		s.restore(base)
+		return err
+	}
 	return nil
 }

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
-	"strings"
 	"unsafe"
 )
 
@@ -51,48 +50,6 @@ func (s *State) Register(name string, fn Func) error {
 	defer C.free(unsafe.Pointer(cname))
 	if C.bridge_setglobal(s.l, cname) != 0 {
 		return fmt.Errorf("luau: failed to set global %q", name)
-	}
-	return nil
-}
-
-// RegisterModule exposes Go functions as a table returned by require(path).
-// The path must begin with "@", and each map key becomes a function field in
-// the registered module. OpenRequire must be called for scripts to use it.
-func (s *State) RegisterModule(path string, functions map[string]Func) error {
-	if !s.open() {
-		return ErrClosed
-	}
-	if !strings.HasPrefix(path, "@") || strings.ContainsRune(path, '\x00') {
-		return errors.New("luau: RegisterModule path must begin with @ and contain no NUL bytes")
-	}
-	for name, fn := range functions {
-		if strings.ContainsRune(name, '\x00') {
-			return fmt.Errorf("luau: RegisterModule function name %q contains a NUL byte", name)
-		}
-		if fn == nil {
-			return fmt.Errorf("luau: RegisterModule function %q is nil", name)
-		}
-	}
-
-	base := s.Top()
-	defer s.restore(base)
-	if err := s.Push(path); err != nil {
-		return err
-	}
-	if err := s.NewTable(0, len(functions)); err != nil {
-		return err
-	}
-	table := base + 2
-	for name, fn := range functions {
-		if err := s.PushFunction(name, fn); err != nil {
-			return err
-		}
-		if err := s.SetField(table, name); err != nil {
-			return err
-		}
-	}
-	if C.bridge_registermodule(s.l, C.int(base+1), C.int(table)) != 0 {
-		return fmt.Errorf("luau: failed to register module %q", path)
 	}
 	return nil
 }

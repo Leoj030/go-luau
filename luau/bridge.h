@@ -126,6 +126,8 @@ extern "C" {
     // Registers the table at table_idx behind the path at path_idx.
     int bridge_registermodule(lua_State* L, int path_idx, int table_idx);
 
+    void bridge_setreadonly(lua_State* L, int idx, int enabled);
+
     #ifdef __cplusplus
 }
 
