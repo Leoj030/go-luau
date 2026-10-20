@@ -160,3 +160,18 @@ func goReqSource(ctx C.uintptr_t, loadname *C.char, outlen *C.size_t, errmsg **C
 	*outlen = C.size_t(len(data))
 	return cBytes(data)
 }
+
+// goReqAsync reports whether the Requirer lets modules yield.
+//
+//export goReqAsync
+func goReqAsync(ctx C.uintptr_t) (ret C.int) {
+	defer func() {
+		if recover() != nil {
+			ret = 0
+		}
+	}()
+	if _, ok := requirerOf(ctx).(YieldingRequirer); ok {
+		return 1
+	}
+	return 0
+}

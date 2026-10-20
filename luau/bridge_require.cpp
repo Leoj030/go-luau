@@ -7,6 +7,9 @@
 #include "luacode.h"
 #include "Luau/Require.h"
 
+// Registry table: light userdata (a module thread) -> { module thread, requirer }.
+static const char* kWaiters = "_GOLUAU_MODULE_WAITERS";
+
 // Implemented in Go (require_callbacks.go). The strings they return are
 // malloc'd, and are freed here.
 extern "C" {
@@ -20,6 +23,7 @@ extern "C" {
     int goReqConfigStatus(uintptr_t ctx);
     char* goReqConfig(uintptr_t ctx, size_t* outlen);
     char* goReqSource(uintptr_t ctx, char* loadname, size_t* outlen, char** errmsg);
+    int goReqAsync(uintptr_t ctx);
 }
 
 static_assert((int)BRIDGE_NAV_SUCCESS == (int)NAVIGATE_SUCCESS &&
@@ -137,7 +141,27 @@ static int req_load(lua_State* L, void* ctx, const char* path, const char* chunk
     if (rstatus == 0) {
         if (lua_gettop(ML) != 1) luaL_error(L, "module must return a single value");
     } else if (rstatus == LUA_YIELD) {
-        luaL_error(L, "module can not yield");
+        // The module paused, for example to wait on a timer. That is only
+        // possible if the host can wake this thread again, and if this thread
+        // is allowed to yield itself.
+        if (!goReqAsync((uintptr_t)ctx) || !lua_isyieldable(L))
+            luaL_error(L, "module can not yield");
+
+        // Remember who waits for the module, so the host can find the
+        // requirer when the module finishes. L's stack is now
+        //   path, cacheKey, chunkname, loadname, ML
+        // and require needs exactly the first four when it yields.
+        int mlIdx = lua_gettop(L);
+        luaL_findtable(L, LUA_REGISTRYINDEX, kWaiters, 1);   // the table
+        lua_pushlightuserdata(L, ML);                         // key
+        lua_createtable(L, 2, 0);                             // value
+        lua_pushvalue(L, mlIdx);
+        lua_rawseti(L, -2, 1);                                // value[1] = ML (keeps it alive)
+        lua_pushthread(L);
+        lua_rawseti(L, -2, 2);                                // value[2] = the requirer
+        lua_rawset(L, mlIdx + 1);                             // table[ML] = value
+        lua_settop(L, mlIdx - 1);
+        return -1;                                            // require yields the requirer
     } else if (lua_isstring(ML, -1)) {
         luaL_error(L, "error while running module: %s", lua_tostring(ML, -1));
     } else {
@@ -230,5 +254,40 @@ extern "C" {
             lua_settop(L, top);
             return -1;
         }
+    }
+
+    lua_State* bridge_takewaiter(lua_State* L, lua_State* ml, int* ref) {
+        int top = lua_gettop(L);
+        try {
+            if (!lua_checkstack(L, 5)) return nullptr;
+            luaL_findtable(L, LUA_REGISTRYINDEX, kWaiters, 1);   // top+1
+            int tbl = top + 1;
+            lua_pushlightuserdata(L, ml);
+            lua_rawget(L, tbl);                                   // top+2
+            lua_State* waiter = nullptr;
+            if (lua_istable(L, top + 2)) {
+                lua_rawgeti(L, top + 2, 2);                       // top+3
+                waiter = lua_tothread(L, top + 3);
+                if (waiter) {
+                    *ref = lua_ref(L, top + 3);
+                    lua_pushlightuserdata(L, ml);
+                    lua_pushnil(L);
+                    lua_rawset(L, tbl);                           // remove the record
+                }
+            }
+            lua_settop(L, top);
+            return waiter;
+        } catch (...) {
+            lua_settop(L, top);
+            return nullptr;
+        }
+    }
+
+    int bridge_xpush(lua_State* from, lua_State* to) {
+        try {
+            if (!lua_checkstack(to, 1)) return -1;
+            lua_xpush(from, to, -1);
+            return 0;
+        } catch (...) { return -1; }
     }
 }

@@ -251,3 +251,38 @@ func (s *State) ClearRequireCacheEntry(cacheKey string) error {
 	}
 	return nil
 }
+
+// YieldingRequirer is a Requirer that lets modules yield while they load,
+// for example by waiting on a timer or a network request at the top level of
+// the module, as in Roblox. A Requirer that doesn't implement it keeps the
+// old behavior: a module that yields fails with "module can not yield".
+//
+// The protocol:
+//
+//  1. A script running in a coroutine calls require, and the module yields.
+//     The coroutine that called require is now suspended, and your resume of
+//     it returns with done == false and no values.
+//  2. You resume the module's thread yourself when its wait is over, using a
+//     handle from Thread() inside the Go function that yielded it. Use
+//     ResumeN for module threads, not Resume, because a module may return
+//     values Resume can't convert.
+//  3. When that thread finishes or fails, ModuleFinished is called, inside
+//     that same Resume call. waiter is the suspended coroutine that called
+//     require. On success the module's result is already on its stack: resume
+//     it with waiter.ResumeN(1), and require returns the result. On failure
+//     err describes the error: resume it with waiter.ResumeError(err), and
+//     require raises it where it was called.
+//
+// ModuleFinished should only queue that resume for your scheduler, not do it
+// on the spot. The waiter is pinned, so Close it when you are done.
+//
+// A module can only yield when require is called from a coroutine. From the
+// main thread it fails as before. If a module is required again while it is
+// still loading, it loads a second time.
+type YieldingRequirer interface {
+	Requirer
+
+	// ModuleFinished is called when a module that yielded while loading has
+	// finished (err is nil) or failed.
+	ModuleFinished(waiter *Thread, err error)
+}

@@ -135,6 +135,17 @@ extern "C" {
     int bridge_clearrequirecache(lua_State* L);
     int bridge_clearrequirecacheentry(lua_State* L, const char* key, size_t len);
 
+    // Module threads that yielded while loading. bridge_takewaiter returns the
+    // thread that is waiting in require for module thread ml (and removes the
+    // record), pinned with *ref, or NULL if there is none.
+    lua_State* bridge_takewaiter(lua_State* L, lua_State* ml, int* ref);
+
+    // Copies the top value of `from` onto the stack of `to`.
+    int bridge_xpush(lua_State* from, lua_State* to);
+
+    // Resumes a suspended thread by raising the error on top of its stack.
+    int bridge_resumeerror(lua_State* co, lua_State* from);
+
     #ifdef __cplusplus
 }
 

@@ -17,6 +17,7 @@ Go bindings for [Luau](https://luau.org), built with cgo. The binding stays clos
 - **Structs and tables.** Push Go structs, slices and maps as tables, and `Decode` tables back into Go structs, with luau field tags.
 - **require**. `OpenRequire` gives scripts Luau’s own `require`, with relative paths, `init` files and `.luaurc` aliases, served from any `fs.FS` or from your own `Requirer`. `RegisterModule` and `RegisterModuleTable` expose Go code as require-able modules, with any value in them.
 - **Async building blocks.** A Go function can suspend its coroutine with `Yield` and get a `Thread()` handle to resume it later, so runtimes can build task, fetch and similar themselves.
+- **Modules can yield while they load,** if the Requirer implements YieldingRequirer.
 
 ## Requirements
 
@@ -204,6 +205,7 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - Module paths are case-insensitive.
 - **For async work:** call `c.Thread()`, start the work on another goroutine, and return `c.Yield(0)`. When the work finishes, send the result to the goroutine that owns the `State` and call `Resume` on the handle there. Never touch a `State` or `Thread` from the worker goroutine, and `Close` the handle when you are done.
 - **Clearing the require cache only affects future requires.** Scripts that already hold a module keep their copy.
+- Link to the protocol in the `YieldingRequirer` doc comment, and note that `ResumeN`, not `Resume`, is the one to use for module threads.
 
 ## Limitations
 
@@ -220,7 +222,7 @@ What the binding doesn't do yet:
 - **Functions registered with `Register` or `PushFunction` live until `Close`.** Registering them in a loop grows memory.
 - **Embedded structs aren’t flattened,** and there are no custom marshalers.
 - **require doesn’t yet support** clearing the cache or cyclic requires with export.
-- A module can’t yield while it loads.
+- A module required again while it is still loading loads a second time.
 
 ## License
 

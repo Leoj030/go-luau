@@ -404,6 +404,15 @@ extern "C" {
         }
     }
 
+    int bridge_resumeerror(lua_State* co, lua_State* from) {
+        try {
+            return lua_resumeerror(co, from);
+        } catch (...) {
+            lua_pushstring(co, "internal error");
+            return LUA_ERRRUN;
+        }
+    }
+
     int bridge_yieldcode(void) { return LUA_YIELD; }
     int bridge_breakcode(void) { return LUA_BREAK; }
 

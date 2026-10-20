@@ -117,43 +117,88 @@ func (t *Thread) Status() ThreadStatus {
 //
 // On a script error the stack is cleared and the error is returned, wrapping
 // ErrMemory or ErrInterrupted where they apply. The thread is then
-// ThreadFailed.
+// ThreadFailed. If the thread is a module that yielded while it was loading
+// (see YieldingRequirer), finishing or failing it also hands the result to the
+// coroutine that is waiting for it in require.
 func (t *Thread) ResumeN(nargs int) (nresults int, done bool, err error) {
+	if cerr := t.checkResumable(nargs, false); cerr != nil {
+		return 0, false, cerr
+	}
+	return t.run(nargs, false)
+}
+
+// ResumeError resumes a suspended thread by raising err at the point where
+// it yielded, as if that call had failed. If a pcall around that point
+// catches it, the thread carries on. Otherwise the thread fails and the
+// error is returned. The thread must have started already and have nothing
+// on its stack. It is how a runtime fails a require whose module failed
+// (see YieldingRequirer).
+func (t *Thread) ResumeError(err error) (nresults int, done bool, resumeErr error) {
+	if err == nil {
+		err = errors.New("error")
+	}
+	if cerr := t.checkResumable(0, true); cerr != nil {
+		return 0, false, cerr
+	}
+	if perr := t.Push(err.Error()); perr != nil {
+		return 0, false, perr
+	}
+	return t.run(1, true)
+}
+
+// checkResumable verifies that the thread can be resumed with nargs values
+// on its stack. raise is true for ResumeError, which can only continue a
+// thread that has already started.
+func (t *Thread) checkResumable(nargs int, raise bool) error {
 	if t.State.l == nil || t.main.l == nil {
-		return 0, false, ErrClosed
+		return ErrClosed
 	}
 	switch t.Status() {
 	case ThreadSuspended:
 	case ThreadFinished:
-		return 0, false, errors.New("luau: thread has finished, or has nothing loaded")
+		return errors.New("luau: thread has finished, or has nothing loaded")
 	case ThreadFailed:
-		return 0, false, errors.New("luau: thread failed and cannot be resumed")
+		return errors.New("luau: thread failed and cannot be resumed")
 	default:
-		return 0, false, errors.New("luau: thread is already running")
+		return errors.New("luau: thread is already running")
 	}
 
 	want := nargs
 	if !t.started {
+		if raise {
+			return errors.New("luau: ResumeError needs a thread that has already started")
+		}
 		want++ // the function itself
 		if t.TypeName(1) != "function" {
-			return 0, false, errors.New("luau: load a chunk onto the thread before the first resume")
+			return errors.New("luau: load a chunk onto the thread before the first resume")
 		}
 	}
 	if nargs < 0 || t.Top() != want {
-		return 0, false, fmt.Errorf("luau: thread stack holds %d values, expected %d", t.Top(), want)
+		return fmt.Errorf("luau: thread stack holds %d values, expected %d", t.Top(), want)
 	}
 	if t.main.depth >= maxResumeDepth {
-		return 0, false, errors.New("luau: too many nested resumes")
+		return errors.New("luau: too many nested resumes")
 	}
+	return nil
+}
 
+// run resumes the thread, normally or with an error, and reports the outcome.
+func (t *Thread) run(nargs int, raise bool) (nresults int, done bool, err error) {
 	t.started = true
 	t.main.depth++
-	status := C.bridge_resume(t.State.l, t.main.l, C.int(nargs))
+	var status C.int
+	if raise {
+		status = C.bridge_resumeerror(t.State.l, t.main.l)
+	} else {
+		status = C.bridge_resume(t.State.l, t.main.l, C.int(nargs))
+	}
 	t.main.depth--
 
 	switch {
 	case status == 0:
-		return t.Top(), true, nil
+		n := t.Top()
+		t.settleModule(nil)
+		return n, true, nil
 	case status == C.bridge_yieldcode():
 		return t.Top(), false, nil
 	case status == C.bridge_breakcode():
@@ -161,7 +206,42 @@ func (t *Thread) ResumeN(nargs int) (nresults int, done bool, err error) {
 		return 0, false, errors.New("luau: thread stopped at a breakpoint (not supported)")
 	}
 	C.bridge_tracethread(t.State.l)
-	return 0, false, t.failWith(0, status)
+	failure := t.failWith(0, status)
+	t.settleModule(failure)
+	return 0, false, failure
+}
+
+// settleModule is called when a thread finishes or fails. If the thread is a
+// module that yielded while loading, it hands the outcome to the coroutine
+// waiting in require, through the Requirer's ModuleFinished.
+func (t *Thread) settleModule(modErr error) {
+	root := t.main
+	if root.reqHandle == 0 {
+		return // require isn't open, so nothing can be waiting
+	}
+	var ref C.int
+	wl := C.bridge_takewaiter(root.l, t.State.l, &ref)
+	if wl == nil {
+		return // t is not a module that yielded while loading
+	}
+	waiter := &Thread{State: &State{l: wl, parent: root}, main: root, ref: Ref(ref), started: true}
+
+	var failure error
+	switch {
+	case modErr != nil:
+		failure = fmt.Errorf("error while running module: %w", modErr)
+	case t.Top() != 1:
+		failure = errors.New("module must return a single value")
+	case C.bridge_xpush(t.State.l, wl) != 0:
+		failure = ErrStackOverflow
+	}
+
+	fin, ok := root.reqHandle.Value().(YieldingRequirer)
+	if !ok { // can't happen: a module only waits if its Requirer supports it
+		waiter.Close()
+		return
+	}
+	fin.ModuleFinished(waiter, failure)
 }
 
 // Runs the thread until it yields, returns or fails.
