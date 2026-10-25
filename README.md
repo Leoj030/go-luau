@@ -129,6 +129,18 @@ res, done, _ := th.Resume(10)  // [11], done = false
 res, done, _ = th.Resume(5)    // ["done", 5], done = true
 ```
 
+## High-level API
+
+`vm` package. An easier interface on top of `luau`: Go functions without the stack, `*Value` handles, modules, `Eval`/`Do`, and context support.
+
+```go
+v, _ := vm.New()
+defer v.Close()
+
+v.Set("add", func(a, b float64) float64 { return a + b })
+v.Do(`print(add(2, 3))`)
+```
+
 ## How the API works
 
 The API mirrors Luau's C API, so it is stack-based. Values are pushed onto and read from a stack, and positions are stack indices:
@@ -206,6 +218,10 @@ Script failures come back as `*luau.Error`, reachable with `errors.As`. `errors.
 - **For async work:** call `c.Thread()`, start the work on another goroutine, and return `c.Yield(0)`. When the work finishes, send the result to the goroutine that owns the `State` and call `Resume` on the handle there. Never touch a `State` or `Thread` from the worker goroutine, and `Close` the handle when you are done.
 - **Clearing the require cache only affects future requires.** Scripts that already hold a module keep their copy.
 - Link to the protocol in the `YieldingRequirer` doc comment, and note that `ResumeN`, not `Resume`, is the one to use for module threads.
+- **Ownership.** Values returned to you (`Eval`, `Get`, `Call`) are pinned until Release. If a script produces many, release them. Values passed into a Go function are released when it returns, and `Retain` keeps one.
+- **Structs are copies.** v.Set("p", player) pushes a table, and scripts changing it don’t change your struct. Exposing a live Go object with methods would be a separate feature, built on userdata, and I’d do it only if you need it.
+- **No async here.** `Do`, `Eval` and `Call` run to completion, and a script that yields returns an error. Async libraries like `task` or `fetch` need the low-level pieces (`Thread()`, `Yield`, `YieldingRequirer`), and `vm` doesn’t hide those. You can still pass a low-level `func(c *luau.State) (int, error)` to `Set` or `Module`, and it works inside the VM.
+- **One context per outermost call.** A nested call from inside a Go function runs under the outer call’s context.
 
 ## Limitations
 
