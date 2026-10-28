@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"unsafe"
 )
 
 // checkTable guards every raw table operation. Luau does not validate
@@ -37,18 +36,44 @@ func (s *State) NewTable(narr, nrec int) error {
 	return nil
 }
 
-// Pushes t[key], where t is the table at idx. The key must not
-// contain NUL bytes. Raw access: metamethods are not invoked.
+// GetField pushes t[key], where t is the table at idx. Raw access:
+// metamethods are not invoked. The key can contain any bytes. It is one cgo
+// call.
 func (s *State) GetField(idx int, key string) error {
-	if err := s.checkTable(idx); err != nil {
-		return err
+	if !s.open() {
+		return ErrClosed
 	}
-	ck := C.CString(key)
-	defer C.free(unsafe.Pointer(ck))
-	if C.bridge_rawgetfield(s.l, C.int(idx), ck) != 0 {
-		return fmt.Errorf("luau: failed to get field %q", key)
+	switch C.bridge_getfield(s.l, C.int(idx), cstr(key), C.size_t(len(key))) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("luau: stack index %d is not valid", idx)
+	case 2:
+		return fmt.Errorf("luau: stack index %d is %s, not a table", idx, s.TypeName(idx))
+	case 4:
+		return ErrStackOverflow
 	}
-	return nil
+	return fmt.Errorf("luau: failed to get field %q", key)
+}
+
+// SetField does t[key] = value, where t is the table at idx and value is
+// the top of the stack. The value is popped. Raw access. The key can contain
+// any bytes. It is one cgo call.
+func (s *State) SetField(idx int, key string) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	switch C.bridge_setfield(s.l, C.int(idx), cstr(key), C.size_t(len(key))) {
+	case 0:
+		return nil
+	case 1:
+		return errors.New("luau: need a table and, above it, a value to store")
+	case 2:
+		return fmt.Errorf("luau: stack index %d is %s, not a table", idx, s.TypeName(idx))
+	case 4:
+		return ErrStackOverflow
+	}
+	return fmt.Errorf("luau: failed to set field %q (is the table frozen?)", key)
 }
 
 // Validates the "table at idx, value on top" layout that the
@@ -63,23 +88,6 @@ func (s *State) checkStore(idx int) (int, error) {
 		return 0, errors.New("luau: need a table and, above it, a value to store")
 	}
 	return t, s.checkTable(t)
-}
-
-// Does t[key] = value, where t is the table at idx and value is
-// the top of the stack. The value is popped. Raw access.
-func (s *State) SetField(idx int, key string) error {
-	t, err := s.checkStore(idx)
-	if err != nil {
-		return err
-	}
-	top := s.Top()
-	ck := C.CString(key)
-	defer C.free(unsafe.Pointer(ck))
-	if C.bridge_rawsetfield(s.l, C.int(t), ck) != 0 {
-		C.bridge_settop(s.l, C.int(top-1))
-		return fmt.Errorf("luau: failed to set field %q", key)
-	}
-	return nil
 }
 
 // Pushes t[n] (arrays are 1-based in Luau), where t is the table

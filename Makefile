@@ -10,6 +10,12 @@ test:
 test-v:
 	go test ./tests/... -v -count=1
 
+test-race:
+	go test ./tests/... -race -count=1
+
+bench:
+	go test ./tests -run xxx -bench . -benchmem
+
 vet:
 	go vet ./...
 

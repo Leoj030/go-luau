@@ -7,9 +7,20 @@ package luau
 import "C"
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
 	"unsafe"
 )
+
+// cstr returns a pointer to the bytes of s for a C call that doesn't keep it.
+// It is nil for an empty string.
+func cstr(s string) *C.char {
+	if len(s) == 0 {
+		return nil
+	}
+	return (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
+}
 
 // Top returns the number of values on the stack (inside a Func, the
 // argument count). A closed State has none, so Top returns 0.
@@ -20,8 +31,7 @@ func (s *State) Top() int {
 	return int(C.bridge_gettop(s.l))
 }
 
-// Converts a negative stack index into an absolute one, using the
-// stack height at the time of the call.
+// abs converts a negative stack index into an absolute one.
 func (s *State) abs(idx int) int {
 	if idx < 0 {
 		return s.Top() + idx + 1
@@ -29,21 +39,39 @@ func (s *State) abs(idx int) int {
 	return idx
 }
 
-// Reports whether idx refers to an existing stack slot. Luau is not
-// safe to ask about indices outside the stack, so check first.
+// valid reports whether idx refers to an existing stack slot. Luau is not
+// safe to ask about indices outside the stack, so this checks first.
 func (s *State) valid(idx int) bool {
-	top := s.Top()
-	return (idx >= 1 && idx <= top) || (idx <= -1 && idx >= -top)
+	return s.open() && C.bridge_typeof(s.l, C.int(idx)) >= 0
 }
 
-// Returns the Luau type name of the value at idx ("nil", "boolean",
-// "number", "string", "table", "function", "userdata", ...), or "no value"
-// if idx is not a valid stack position.
+var typeNames = [...]string{
+	C.BRIDGE_T_NIL:      "nil",
+	C.BRIDGE_T_BOOLEAN:  "boolean",
+	C.BRIDGE_T_NUMBER:   "number",
+	C.BRIDGE_T_STRING:   "string",
+	C.BRIDGE_T_TABLE:    "table",
+	C.BRIDGE_T_FUNCTION: "function",
+	C.BRIDGE_T_USERDATA: "userdata",
+	C.BRIDGE_T_THREAD:   "thread",
+}
+
+// TypeName returns the Luau type name of the value at idx ("nil",
+// "boolean", "number", "string", "table", "function", "userdata", ...), or
+// "no value" if idx is not a valid stack position. It is one cgo call, and
+// allocates nothing for the common types.
 func (s *State) TypeName(idx int) string {
-	if !s.valid(idx) {
+	if !s.open() {
 		return "no value"
 	}
-	return C.GoString(C.bridge_typename(s.l, C.int(idx)))
+	code := int(C.bridge_typeof(s.l, C.int(idx)))
+	switch {
+	case code < 0:
+		return "no value"
+	case code < len(typeNames):
+		return typeNames[code]
+	}
+	return C.GoString(C.bridge_typename(s.l, C.int(idx))) // vector, buffer and the like
 }
 
 // Pop removes n values from the top of the stack.
@@ -51,37 +79,8 @@ func (s *State) Pop(n int) error {
 	if !s.open() {
 		return ErrClosed
 	}
-	top := s.Top()
-	if n < 0 || n > top {
-		return fmt.Errorf("luau: cannot pop %d values from a stack of %d", n, top)
-	}
-	C.bridge_settop(s.l, C.int(top-n))
-	return nil
-}
-
-// pushError says why a push failed: the stack is full, or Luau ran out of
-// memory.
-func (s *State) pushError() error {
-	if C.bridge_checkstack(s.l, 1) == 0 {
-		return ErrStackOverflow
-	}
-	return ErrMemory
-}
-
-// CheckStack makes sure the stack has room for n more values, growing it if
-// needed. Push and the other functions that add values already reserve space
-// for themselves, so CheckStack is only for failing early before a large
-// batch of pushes. It returns ErrStackOverflow if the stack can't grow that
-// far.
-func (s *State) CheckStack(n int) error {
-	if !s.open() {
-		return ErrClosed
-	}
-	if n < 0 {
-		return fmt.Errorf("luau: CheckStack needs a count of 0 or more, got %d", n)
-	}
-	if C.bridge_checkstack(s.l, C.int(n)) == 0 {
-		return ErrStackOverflow
+	if C.bridge_pop(s.l, C.int(n)) != 0 {
+		return fmt.Errorf("luau: cannot pop %d values from a stack of %d", n, s.Top())
 	}
 	return nil
 }
@@ -112,21 +111,14 @@ func (s *State) CheckStack(n int) error {
 // to a depth of 100 levels, and the table is a copy: changing it in Luau
 // doesn't change the Go value. If anything fails, nothing is left on the
 // stack. Push returns ErrStackOverflow if the stack is full.
+//
+// A slice, map or struct is flattened in Go and built by Luau in a single
+// cgo call, however many entries it has. To do the flattening on another
+// goroutine, use Encode and PushEncoded.
 func (s *State) Push(v any) error {
 	if !s.open() {
 		return ErrClosed
 	}
-	base := s.Top()
-	if err := s.pushValue(v, 0); err != nil {
-		s.restore(base)
-		return err
-	}
-	return nil
-}
-
-// pushValue pushes v and recurses into slices and maps. depth counts the
-// levels of nesting so far.
-func (s *State) pushValue(v any, depth int) error {
 	var rc C.int
 	switch x := v.(type) {
 	case nil:
@@ -144,16 +136,57 @@ func (s *State) pushValue(v any, depth int) error {
 	case float64:
 		rc = C.bridge_pushnumber(s.l, C.double(x))
 	case string:
-		var p *C.char
-		if len(x) > 0 {
-			p = (*C.char)(unsafe.Pointer(unsafe.StringData(x)))
-		}
-		rc = C.bridge_pushlstring(s.l, p, C.size_t(len(x)))
+		rc = C.bridge_pushlstring(s.l, cstr(x), C.size_t(len(x)))
 	default:
-		return s.pushComposite(v, depth)
+		return s.pushOther(v)
 	}
 	if rc != 0 {
 		return s.pushError()
+	}
+	return nil
+}
+
+// pushOther handles the values Push doesn't switch on directly: the other
+// number types and named scalars, and everything that becomes a table.
+func (s *State) pushOther(v any) error {
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Bool:
+		return s.Push(rv.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return s.Push(float64(rv.Int()))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return s.Push(float64(rv.Uint()))
+	case reflect.Float32, reflect.Float64:
+		return s.Push(rv.Float())
+	case reflect.String:
+		return s.Push(rv.String())
+	}
+	return s.pushEncoded(v)
+}
+
+// pushError says why a push failed: the stack is full, or Luau ran out of
+// memory.
+func (s *State) pushError() error {
+	if C.bridge_checkstack(s.l, 1) == 0 {
+		return ErrStackOverflow
+	}
+	return ErrMemory
+}
+
+// CheckStack makes sure the stack has room for n more values, growing it if
+// needed. Push and the other functions that add values already reserve space
+// for themselves, so CheckStack is only for failing early before a large
+// batch of pushes. It returns ErrStackOverflow if the stack can't grow that
+// far.
+func (s *State) CheckStack(n int) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if n < 0 {
+		return fmt.Errorf("luau: CheckStack needs a count of 0 or more, got %d", n)
+	}
+	if C.bridge_checkstack(s.l, C.int(n)) == 0 {
+		return ErrStackOverflow
 	}
 	return nil
 }
@@ -178,17 +211,14 @@ func (s *State) pushValue(v any, depth int) error {
 // is a table with a key that isn't a string, number or boolean. Shared
 // sub-tables are copied once per reference.
 //
+// A table is read in a single cgo call, however many entries it has.
+//
 // An index that doesn't exist is an error, which is different from a slot
 // that holds nil.
 func (s *State) Get(idx int) (any, error) {
 	if !s.open() {
 		return nil, ErrClosed
 	}
-	return s.get(idx, 0)
-}
-
-// get is Get with the nesting depth of the table being converted.
-func (s *State) get(idx, depth int) (any, error) {
 	switch tn := s.TypeName(idx); tn {
 	case "no value":
 		return nil, fmt.Errorf("luau: stack index %d is not valid", idx)
@@ -204,8 +234,14 @@ func (s *State) get(idx, depth int) (any, error) {
 		p := C.bridge_tostring(s.l, C.int(idx), &n)
 		return C.GoStringN(p, C.int(n)), nil
 	case "table":
-		return s.tableToGo(idx, depth)
+		n, err := s.readNode(idx, 0)
+		if err != nil {
+			return nil, err
+		}
+		return n.toAny()
 	default:
 		return nil, fmt.Errorf("luau: unsupported type %s", tn)
 	}
 }
+
+var errMalformed = errors.New("luau: internal error: malformed value")

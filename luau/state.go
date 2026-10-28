@@ -26,6 +26,7 @@ type State struct {
 	nextID    int
 	names     []*C.char  // debug names; Luau keeps these pointers, so they live until Close
 	reqHandle cgo.Handle // the Requirer behind require, if OpenRequire was called
+	wire      []byte     // scratch buffer for Push (main state only)
 }
 
 // Returns the state that owns the Go function registry: the main

@@ -10,6 +10,7 @@ import (
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // maxConvertDepth bounds how deeply nested a value can be when it is
@@ -21,41 +22,6 @@ var errTooDeep = fmt.Errorf("luau: value is nested more than %d levels deep (is 
 
 // restore cuts the stack back to base values.
 func (s *State) restore(base int) { C.bridge_settop(s.l, C.int(base)) }
-
-// pushComposite pushes what pushValue doesn't handle directly: slices,
-// arrays and maps become tables, and numbers, booleans and strings of other
-// types (int32, float32, a named type like `type ID int`) are converted by
-// their kind.
-func (s *State) pushComposite(v any, depth int) error {
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Bool:
-		return s.pushValue(rv.Bool(), depth)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return s.pushValue(float64(rv.Int()), depth)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return s.pushValue(float64(rv.Uint()), depth)
-	case reflect.Float32, reflect.Float64:
-		return s.pushValue(rv.Float(), depth)
-	case reflect.String:
-		return s.pushValue(rv.String(), depth)
-	case reflect.Slice, reflect.Array:
-		return s.pushList(rv, depth)
-	case reflect.Map:
-		return s.pushMap(rv, depth)
-	case reflect.Struct:
-		return s.pushStruct(rv, depth)
-	case reflect.Pointer:
-		if rv.IsNil() {
-			return s.pushValue(nil, depth)
-		}
-		if depth >= maxConvertDepth {
-			return errTooDeep
-		}
-		return s.pushValue(rv.Elem().Interface(), depth+1)
-	}
-	return fmt.Errorf("luau: cannot push %T", v)
-}
 
 // structField describes one exported field of a struct and how it is named
 // in Luau.
@@ -89,110 +55,35 @@ func structFields(t reflect.Type) []structField {
 	return fields
 }
 
-// pushStruct pushes a struct as a table keyed by field name. On failure the
-// caller restores the stack.
-func (s *State) pushStruct(rv reflect.Value, depth int) error {
-	if depth >= maxConvertDepth {
-		return errTooDeep
+var (
+	fieldsCache   sync.Map // reflect.Type -> []structField
+	fieldMapCache sync.Map // reflect.Type -> map[string]structField
+)
+
+// cachedFields is structFields, computed once per type.
+func cachedFields(t reflect.Type) []structField {
+	if v, ok := fieldsCache.Load(t); ok {
+		return v.([]structField)
 	}
-	fields := structFields(rv.Type())
-	if err := s.NewTable(0, len(fields)); err != nil {
-		return err
-	}
-	for _, f := range fields {
-		fv := rv.Field(f.index)
-		if f.omitEmpty && fv.IsZero() {
-			continue
-		}
-		if err := s.pushValue(f.name, depth+1); err != nil {
-			return err
-		}
-		if err := s.pushValue(fv.Interface(), depth+1); err != nil {
-			return fmt.Errorf("luau: field %s: %w", f.name, err)
-		}
-		if err := s.RawSet(-3); err != nil {
-			return err
-		}
-	}
-	return nil
+	f := structFields(t)
+	fieldsCache.Store(t, f)
+	return f
 }
 
-// pushList pushes a slice or array as an array table. A []byte becomes a
-// string instead. On failure the caller restores the stack.
-func (s *State) pushList(rv reflect.Value, depth int) error {
-	if depth >= maxConvertDepth {
-		return errTooDeep
+// fieldMap returns the fields of t by their Luau name, computed once per type.
+func fieldMap(t reflect.Type) map[string]structField {
+	if v, ok := fieldMapCache.Load(t); ok {
+		return v.(map[string]structField)
 	}
-	if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
-		return s.pushValue(string(rv.Bytes()), depth)
+	m := map[string]structField{}
+	for _, f := range cachedFields(t) {
+		m[f.name] = f
 	}
-	n := rv.Len()
-	if err := s.NewTable(n, 0); err != nil {
-		return err
-	}
-	for i := 0; i < n; i++ {
-		if err := s.pushValue(rv.Index(i).Interface(), depth+1); err != nil {
-			return err
-		}
-		if err := s.SetIndex(-2, i+1); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// pushMap pushes a map as a table. Keys can be strings, numbers or
-// booleans. On failure the caller restores the stack.
-func (s *State) pushMap(rv reflect.Value, depth int) error {
-	if depth >= maxConvertDepth {
-		return errTooDeep
-	}
-	if err := s.NewTable(0, rv.Len()); err != nil {
-		return err
-	}
-	iter := rv.MapRange()
-	for iter.Next() {
-		if err := s.pushValue(iter.Key().Interface(), depth+1); err != nil {
-			return err
-		}
-		if err := s.pushValue(iter.Value().Interface(), depth+1); err != nil {
-			return err
-		}
-		if err := s.RawSet(-3); err != nil {
-			return err
-		}
-	}
-	return nil
+	fieldMapCache.Store(t, m)
+	return m
 }
 
 type tableEntry struct{ key, val any }
-
-// tableToGo converts the table at idx. See Get for the rules.
-func (s *State) tableToGo(idx, depth int) (any, error) {
-	if depth >= maxConvertDepth {
-		return nil, errTooDeep
-	}
-	var entries []tableEntry
-	err := s.ForEach(idx, func() error {
-		if kt := s.TypeName(-2); kt != "string" && kt != "number" && kt != "boolean" {
-			return fmt.Errorf("luau: cannot convert a table that has a %s key", kt)
-		}
-		k, err := s.get(-2, depth+1)
-		if err != nil {
-			return err
-		}
-		v, err := s.get(-1, depth+1)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, tableEntry{k, v})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return classify(entries), nil
-}
 
 // classify picks the Go shape for a table's entries: a list, a map with
 // string keys, or a map with any keys.

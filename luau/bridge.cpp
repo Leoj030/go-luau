@@ -50,6 +50,7 @@ struct Host {
     size_t limit;
     std::atomic<int> interrupted;
     std::string traceback;       // traceback of the last error, filled by pcall_handler
+    std::string scratch;         // output buffer of bridge_encode, reused between calls
 };
 
 static Host* host_of(lua_State* L) { return (Host*)lua_callbacks(L)->userdata; }
@@ -60,6 +61,174 @@ static Host* host_of(lua_State* L) { return (Host*)lua_callbacks(L)->userdata; }
 static int reserve(lua_State* L, int n) {
     try { return lua_checkstack(L, n) ? 0 : -1; }
     catch (...) { return -1; }
+}
+
+// ---- wire format -----------------------------------------------------------
+// Shared with luau/wire.go. Numbers are little-endian.
+//   0 nil      1 false     2 true
+//   3 number   8 bytes, the bits of a double
+//   4 string   u32 length, then the bytes
+//   5 array    u32 n, then n values (the keys 1..n)                  [written by Go]
+//   6 map      u32 n, then n (key, value) pairs
+//   7 bad      u32 length, then the Lua type name: a value or key that can't be converted
+//   8 deep     a table nested too deeply
+// A "bad" or "deep" marker is not an error by itself: the Go side only complains
+// if it actually needs that value, so a table can hold a function that nobody asks for.
+enum { W_NIL = 0, W_FALSE, W_TRUE, W_NUM, W_STR, W_ARR, W_MAP, W_BAD, W_DEEP };
+
+static void put_u32(std::string& out, uint32_t v) {
+    char b[4] = { (char)(v & 0xff), (char)((v >> 8) & 0xff), (char)((v >> 16) & 0xff), (char)((v >> 24) & 0xff) };
+    out.append(b, 4);
+}
+
+static void put_u64(std::string& out, uint64_t v) {
+    char b[8];
+    for (int i = 0; i < 8; i++) b[i] = (char)((v >> (8 * i)) & 0xff);
+    out.append(b, 8);
+}
+
+static void put_bytes(std::string& out, const char* s, size_t n) {
+    put_u32(out, (uint32_t)n);
+    out.append(s, n);
+}
+
+static void enc(lua_State* L, int idx, std::string& out, int depth, int maxdepth, int* err);
+
+// Keys that aren't a string, number or boolean become a "bad" marker.
+static void enc_key(lua_State* L, int idx, std::string& out) {
+    int t = lua_type(L, idx);
+    if (t == LUA_TSTRING || t == LUA_TNUMBER || t == LUA_TBOOLEAN) {
+        int err = 0;
+        enc(L, idx, out, 0, 0, &err);   // a scalar never recurses
+        return;
+    }
+    const char* name = lua_typename(L, t);
+    out.push_back((char)W_BAD);
+    put_bytes(out, name, strlen(name));
+}
+
+// Encodes the value at the absolute index idx.
+static void enc(lua_State* L, int idx, std::string& out, int depth, int maxdepth, int* err) {
+    switch (lua_type(L, idx)) {
+    case LUA_TNIL:
+        out.push_back((char)W_NIL);
+        return;
+    case LUA_TBOOLEAN:
+        out.push_back((char)(lua_toboolean(L, idx) ? W_TRUE : W_FALSE));
+        return;
+    case LUA_TNUMBER: {
+        double d = lua_tonumber(L, idx);
+        uint64_t bits;
+        memcpy(&bits, &d, sizeof bits);
+        out.push_back((char)W_NUM);
+        put_u64(out, bits);
+        return;
+    }
+    case LUA_TSTRING: {
+        size_t n = 0;
+        const char* s = lua_tolstring(L, idx, &n);
+        out.push_back((char)W_STR);
+        put_bytes(out, s, n);
+        return;
+    }
+    case LUA_TTABLE:
+        break;
+    default: {
+        const char* name = lua_typename(L, lua_type(L, idx));
+        out.push_back((char)W_BAD);
+        put_bytes(out, name, strlen(name));
+        return;
+    }
+    }
+
+    if (depth >= maxdepth) {
+        out.push_back((char)W_DEEP);
+        return;
+    }
+    if (!lua_checkstack(L, 4)) {
+        *err = BRIDGE_ENC_STACK;
+        return;
+    }
+
+    out.push_back((char)W_MAP);
+    size_t countAt = out.size();
+    put_u32(out, 0);
+    uint32_t count = 0;
+
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        int top = lua_gettop(L);          // the value is at top, its key at top - 1
+        enc_key(L, top - 1, out);
+        enc(L, top, out, depth + 1, maxdepth, err);
+        if (*err) return;                 // the caller restores the stack
+        count++;
+        lua_settop(L, top - 1);           // pop the value, keep the key for the next step
+    }
+    for (int i = 0; i < 4; i++) out[countAt + i] = (char)((count >> (8 * i)) & 0xff);
+}
+
+static bool rd_u32(const unsigned char*& p, const unsigned char* end, uint32_t* v) {
+    if (end - p < 4) return false;
+    *v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    p += 4;
+    return true;
+}
+
+// Reads one value from the wire format and pushes it. Returns false if the
+// input is malformed.
+static bool build(lua_State* L, const unsigned char*& p, const unsigned char* end, int depth) {
+    if (p >= end || depth > 200) return false;
+    unsigned char tag = *p++;
+    switch (tag) {
+    case W_NIL:
+        lua_pushnil(L);
+        return true;
+    case W_FALSE:
+        lua_pushboolean(L, 0);
+        return true;
+    case W_TRUE:
+        lua_pushboolean(L, 1);
+        return true;
+    case W_NUM: {
+        if (end - p < 8) return false;
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; i++) bits |= (uint64_t)p[i] << (8 * i);
+        p += 8;
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        lua_pushnumber(L, d);
+        return true;
+    }
+    case W_STR: {
+        uint32_t n;
+        if (!rd_u32(p, end, &n) || (size_t)(end - p) < n) return false;
+        lua_pushlstring(L, n ? (const char*)p : "", n);
+        p += n;
+        return true;
+    }
+    case W_ARR: {
+        uint32_t n;
+        if (!rd_u32(p, end, &n) || n > (size_t)(end - p) || !lua_checkstack(L, 4)) return false;
+        lua_createtable(L, (int)n, 0);
+        for (uint32_t i = 1; i <= n; i++) {
+            if (!build(L, p, end, depth + 1)) return false;
+            lua_rawseti(L, -2, (int)i);
+        }
+        return true;
+    }
+    case W_MAP: {
+        uint32_t n;
+        if (!rd_u32(p, end, &n) || n > (size_t)(end - p) || !lua_checkstack(L, 4)) return false;
+        lua_createtable(L, 0, (int)n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (!build(L, p, end, depth + 1)) return false;   // the key
+            if (!build(L, p, end, depth + 1)) return false;   // the value
+            lua_rawset(L, -3);
+        }
+        return true;
+    }
+    }
+    return false;
 }
 
 // Appends one line per stack frame, innermost first, starting at firstlevel.
@@ -439,5 +608,104 @@ extern "C" {
 
     void bridge_setreadonly(lua_State* L, int idx, int enabled) {
         lua_setreadonly(L, idx, enabled);
+    }
+
+    int bridge_typeof(lua_State* L, int idx) {
+        int top = lua_gettop(L);
+        if (!((idx >= 1 && idx <= top) || (idx <= -1 && idx >= -top))) return BRIDGE_T_NONE;
+        switch (lua_type(L, idx)) {
+            case LUA_TNIL: return BRIDGE_T_NIL;
+            case LUA_TBOOLEAN: return BRIDGE_T_BOOLEAN;
+            case LUA_TNUMBER: return BRIDGE_T_NUMBER;
+            case LUA_TSTRING: return BRIDGE_T_STRING;
+            case LUA_TTABLE: return BRIDGE_T_TABLE;
+            case LUA_TFUNCTION: return BRIDGE_T_FUNCTION;
+            case LUA_TUSERDATA: return BRIDGE_T_USERDATA;
+            case LUA_TTHREAD: return BRIDGE_T_THREAD;
+            default: return BRIDGE_T_OTHER;
+        }
+    }
+
+    int bridge_pop(lua_State* L, int n) {
+        int top = lua_gettop(L);
+        if (n < 0 || n > top) return -1;
+        lua_settop(L, top - n);
+        return 0;
+    }
+
+    // Pushes t[key] for the table at idx.
+    int bridge_getfield(lua_State* L, int idx, const char* key, size_t klen) {
+        int top = lua_gettop(L);
+        if (idx < 0) idx = top + idx + 1;
+        if (idx < 1 || idx > top) return 1;
+        if (lua_type(L, idx) != LUA_TTABLE) return 2;
+        if (reserve(L, 1)) return 4;
+        try {
+            lua_pushlstring(L, klen ? key : "", klen);
+            lua_rawget(L, idx);
+            return 0;
+        } catch (...) {
+            lua_settop(L, top);
+            return 3;
+        }
+    }
+
+    // Does t[key] = value for the table at idx and the value on top, and pops the value.
+    int bridge_setfield(lua_State* L, int idx, const char* key, size_t klen) {
+        int top = lua_gettop(L);
+        if (idx < 0) idx = top + idx + 1;
+        if (top < 2 || idx < 1 || idx >= top) return 1;
+        if (lua_type(L, idx) != LUA_TTABLE) return 2;
+        if (reserve(L, 1)) return 4;
+        try {
+            lua_pushlstring(L, klen ? key : "", klen);
+            lua_insert(L, -2);       // the key goes below the value
+            lua_rawset(L, idx);      // pops both
+            return 0;
+        } catch (...) {
+            lua_settop(L, top - 1);
+            return 3;
+        }
+    }
+
+    // Encodes the value at idx into the host's reusable buffer. The data stays
+    // valid until the next call that uses the buffer, so the caller copies or parses it at once.
+    int bridge_encode(lua_State* L, int idx, int maxdepth, const char** data, size_t* len) {
+        int top = lua_gettop(L);
+        if (idx < 0) idx = top + idx + 1;
+        if (idx < 1 || idx > top) return BRIDGE_ENC_BADINDEX;
+        Host* h = host_of(L);
+        int err = BRIDGE_ENC_OK;
+        try {
+            if (h->scratch.capacity() > (1u << 20)) std::string().swap(h->scratch);   // don't keep a big buffer
+            h->scratch.clear();
+            enc(L, idx, h->scratch, 0, maxdepth, &err);
+        } catch (...) {
+            lua_settop(L, top);
+            return BRIDGE_ENC_MEMORY;
+        }
+        lua_settop(L, top);
+        if (err) return err;
+        *data = h->scratch.data();
+        *len = h->scratch.size();
+        return BRIDGE_ENC_OK;
+    }
+
+    // Returns 0, -1 (stack full or out of memory) or -2 (malformed input).
+    int bridge_pushencoded(lua_State* L, const char* data, size_t len) {
+        int top = lua_gettop(L);
+        try {
+            if (!lua_checkstack(L, 4)) return -1;
+            const unsigned char* p = (const unsigned char*)data;
+            const unsigned char* end = p + len;
+            if (!build(L, p, end, 0) || p != end) {
+                lua_settop(L, top);
+                return -2;
+            }
+            return 0;
+        } catch (...) {
+            lua_settop(L, top);
+            return -1;
+        }
     }
 }

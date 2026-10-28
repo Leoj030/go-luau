@@ -1,10 +1,5 @@
 package luau
 
-/*
-#include "bridge.h"
-*/
-import "C"
-
 import (
 	"fmt"
 	"math"
@@ -31,6 +26,9 @@ import (
 //
 // The value is read raw and nested up to 100 levels deep. Errors name the
 // path to the value that failed, such as "Pos.X" or "tags[2]".
+//
+// The whole value is read in a single cgo call. To do the filling on another
+// goroutine, take a Snapshot and decode that.
 func (s *State) Decode(idx int, v any) error {
 	if !s.open() {
 		return ErrClosed
@@ -39,23 +37,23 @@ func (s *State) Decode(idx int, v any) error {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return fmt.Errorf("luau: Decode needs a non-nil pointer, got %T", v)
 	}
-	if !s.valid(idx) {
-		return fmt.Errorf("luau: stack index %d is not valid", idx)
+	n, err := s.readNode(idx, 0)
+	if err != nil {
+		return err
 	}
-	return s.decode(s.abs(idx), rv.Elem(), 0, "")
+	return assign(&n, rv.Elem(), 0, "")
 }
 
-// decode fills dst from the stack slot at the absolute index idx. path is
-// where dst sits inside the value being decoded, for error messages.
-func (s *State) decode(idx int, dst reflect.Value, depth int, path string) error {
+// assign fills dst from n. path is where dst sits inside the value being
+// decoded, for error messages.
+func assign(n *node, dst reflect.Value, depth int, path string) error {
 	if depth > maxConvertDepth {
 		return errTooDeep
 	}
-	tn := s.TypeName(idx)
 
 	// An empty interface takes whatever Get would produce.
 	if dst.Kind() == reflect.Interface && dst.NumMethod() == 0 {
-		v, err := s.get(idx, depth)
+		v, err := n.toAny()
 		if err != nil {
 			return decodeErr(path, err)
 		}
@@ -67,97 +65,90 @@ func (s *State) decode(idx int, dst reflect.Value, depth int, path string) error
 		return nil
 	}
 
-	if tn == "nil" {
+	switch n.kind {
+	case nNil:
 		dst.Set(reflect.Zero(dst.Type()))
 		return nil
+	case nDeep:
+		return decodeErr(path, errTooDeep)
 	}
 
 	if dst.Kind() == reflect.Pointer {
 		if dst.IsNil() {
 			dst.Set(reflect.New(dst.Type().Elem()))
 		}
-		return s.decode(idx, dst.Elem(), depth+1, path)
+		return assign(n, dst.Elem(), depth+1, path)
 	}
 
 	switch dst.Kind() {
 	case reflect.Bool:
-		if tn != "boolean" {
-			return mismatch(path, tn, dst)
+		if n.kind != nBool {
+			return mismatch(path, n.luaType(), dst)
 		}
-		dst.SetBool(C.bridge_toboolean(s.l, C.int(idx)) != 0)
-		return nil
+		dst.SetBool(n.b)
 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		f, err := s.numberAt(idx, tn, path, dst)
-		if err != nil {
-			return err
+		if n.kind != nNum {
+			return mismatch(path, n.luaType(), dst)
 		}
-		n, ok := floatToInt(f)
-		if !ok || dst.OverflowInt(n) {
-			return decodeErr(path, fmt.Errorf("%v isn't a whole number that fits in %s", f, dst.Type()))
+		i, ok := floatToInt(n.n)
+		if !ok || dst.OverflowInt(i) {
+			return decodeErr(path, fmt.Errorf("%v isn't a whole number that fits in %s", n.n, dst.Type()))
 		}
-		dst.SetInt(n)
-		return nil
+		dst.SetInt(i)
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		f, err := s.numberAt(idx, tn, path, dst)
-		if err != nil {
-			return err
+		if n.kind != nNum {
+			return mismatch(path, n.luaType(), dst)
 		}
-		n, ok := floatToUint(f)
-		if !ok || dst.OverflowUint(n) {
-			return decodeErr(path, fmt.Errorf("%v isn't a whole number that fits in %s", f, dst.Type()))
+		u, ok := floatToUint(n.n)
+		if !ok || dst.OverflowUint(u) {
+			return decodeErr(path, fmt.Errorf("%v isn't a whole number that fits in %s", n.n, dst.Type()))
 		}
-		dst.SetUint(n)
-		return nil
+		dst.SetUint(u)
 
 	case reflect.Float32, reflect.Float64:
-		f, err := s.numberAt(idx, tn, path, dst)
-		if err != nil {
-			return err
+		if n.kind != nNum {
+			return mismatch(path, n.luaType(), dst)
 		}
-		if dst.OverflowFloat(f) {
-			return decodeErr(path, fmt.Errorf("%v doesn't fit in %s", f, dst.Type()))
+		if dst.OverflowFloat(n.n) {
+			return decodeErr(path, fmt.Errorf("%v doesn't fit in %s", n.n, dst.Type()))
 		}
-		dst.SetFloat(f)
-		return nil
+		dst.SetFloat(n.n)
 
 	case reflect.String:
-		if tn != "string" {
-			return mismatch(path, tn, dst)
+		if n.kind != nStr {
+			return mismatch(path, n.luaType(), dst)
 		}
-		dst.SetString(s.stringAt(idx))
-		return nil
+		dst.SetString(n.s)
 
 	case reflect.Slice:
-		if dst.Type().Elem().Kind() == reflect.Uint8 && tn == "string" {
-			dst.SetBytes([]byte(s.stringAt(idx)))
+		if dst.Type().Elem().Kind() == reflect.Uint8 && n.kind == nStr {
+			dst.SetBytes([]byte(n.s))
 			return nil
 		}
-		return s.decodeList(idx, dst, tn, depth, path)
+		return assignList(n, dst, depth, path)
 
 	case reflect.Array:
-		return s.decodeList(idx, dst, tn, depth, path)
+		return assignList(n, dst, depth, path)
 
 	case reflect.Map:
-		return s.decodeMap(idx, dst, tn, depth, path)
+		return assignMap(n, dst, depth, path)
 
 	case reflect.Struct:
-		return s.decodeStruct(idx, dst, tn, depth, path)
+		return assignStruct(n, dst, depth, path)
+
+	default:
+		return decodeErr(path, fmt.Errorf("can't decode into %s", dst.Type()))
 	}
-	return decodeErr(path, fmt.Errorf("can't decode into %s", dst.Type()))
+	return nil
 }
 
-func (s *State) decodeList(idx int, dst reflect.Value, tn string, depth int, path string) error {
-	if tn != "table" {
-		return mismatch(path, tn, dst)
+func assignList(n *node, dst reflect.Value, depth int, path string) error {
+	if n.kind != nTable {
+		return mismatch(path, n.luaType(), dst)
 	}
-
-	// First pass: count the entries, so the slice can be sized.
-	count := 0
-	if err := s.ForEach(idx, func() error { count++; return nil }); err != nil {
-		return decodeErr(path, err)
-	}
+	count := len(n.pairs)
 	var out reflect.Value
 	if dst.Kind() == reflect.Slice {
 		out = reflect.MakeSlice(dst.Type(), count, count)
@@ -168,90 +159,72 @@ func (s *State) decodeList(idx int, dst reflect.Value, tn string, depth int, pat
 		out = reflect.New(dst.Type()).Elem()
 	}
 
-	// Second pass: the keys must be exactly 1..count.
+	// The keys must be exactly 1..count.
 	seen := make([]bool, count)
-	err := s.ForEach(idx, func() error {
-		if kt := s.TypeName(-2); kt != "number" {
-			return decodeErr(path, fmt.Errorf("the table isn't an array: it has a %s key", kt))
+	for i := range n.pairs {
+		p := &n.pairs[i]
+		if p.key.kind != nNum {
+			return decodeErr(path, fmt.Errorf("the table isn't an array: it has a %s key", p.key.luaType()))
 		}
-		var ok C.int
-		f := float64(C.bridge_tonumber(s.l, -2, &ok))
+		f := p.key.n
 		if f != math.Trunc(f) || f < 1 || f > float64(count) || seen[int(f)-1] {
 			return decodeErr(path, fmt.Errorf("the table isn't an array: key %v is out of place", f))
 		}
 		seen[int(f)-1] = true
-		return s.decode(s.Top(), out.Index(int(f)-1), depth+1, fmt.Sprintf("%s[%d]", path, int(f)))
-	})
-	if err != nil {
-		return err
+		if err := assign(&p.val, out.Index(int(f)-1), depth+1, fmt.Sprintf("%s[%d]", path, int(f))); err != nil {
+			return err
+		}
 	}
 	dst.Set(out)
 	return nil
 }
 
-func (s *State) decodeMap(idx int, dst reflect.Value, tn string, depth int, path string) error {
-	if tn != "table" {
-		return mismatch(path, tn, dst)
+func assignMap(n *node, dst reflect.Value, depth int, path string) error {
+	if n.kind != nTable {
+		return mismatch(path, n.luaType(), dst)
 	}
 	kt, vt := dst.Type().Key(), dst.Type().Elem()
-	out := reflect.MakeMap(dst.Type())
-	err := s.ForEach(idx, func() error {
-		if kn := s.TypeName(-2); kn != "string" && kn != "number" && kn != "boolean" {
-			return decodeErr(path, fmt.Errorf("can't use a %s key in a Go map", kn))
+	out := reflect.MakeMapWithSize(dst.Type(), len(n.pairs))
+	for i := range n.pairs {
+		p := &n.pairs[i]
+		switch p.key.kind {
+		case nStr, nNum, nBool:
+		default:
+			return decodeErr(path, fmt.Errorf("can't use a %s key in a Go map", p.key.luaType()))
 		}
 		key := reflect.New(kt).Elem()
-		if err := s.decode(s.Top()-1, key, depth+1, path); err != nil {
+		if err := assign(&p.key, key, depth+1, path); err != nil {
 			return err
 		}
 		val := reflect.New(vt).Elem()
-		if err := s.decode(s.Top(), val, depth+1, joinPath(path, fmt.Sprint(key.Interface()))); err != nil {
+		if err := assign(&p.val, val, depth+1, joinPath(path, fmt.Sprint(key.Interface()))); err != nil {
 			return err
 		}
 		out.SetMapIndex(key, val)
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 	dst.Set(out)
 	return nil
 }
 
-func (s *State) decodeStruct(idx int, dst reflect.Value, tn string, depth int, path string) error {
-	if tn != "table" {
-		return mismatch(path, tn, dst)
+func assignStruct(n *node, dst reflect.Value, depth int, path string) error {
+	if n.kind != nTable {
+		return mismatch(path, n.luaType(), dst)
 	}
-	fields := map[string]structField{}
-	for _, f := range structFields(dst.Type()) {
-		fields[f.name] = f
-	}
-	return s.ForEach(idx, func() error {
-		if s.TypeName(-2) != "string" {
-			return nil // only a string key can name a field
+	fields := fieldMap(dst.Type())
+	for i := range n.pairs {
+		p := &n.pairs[i]
+		if p.key.kind != nStr {
+			continue // only a string key can name a field
 		}
-		name := s.stringAt(s.Top() - 1)
-		f, ok := fields[name]
+		f, ok := fields[p.key.s]
 		if !ok {
-			return nil // unknown keys are ignored, and never converted
+			continue // unknown keys are ignored, and never converted
 		}
-		return s.decode(s.Top(), dst.Field(f.index), depth+1, joinPath(path, name))
-	})
-}
-
-// numberAt reads the number at idx, or explains why it isn't one.
-func (s *State) numberAt(idx int, tn, path string, dst reflect.Value) (float64, error) {
-	if tn != "number" {
-		return 0, mismatch(path, tn, dst)
+		if err := assign(&p.val, dst.Field(f.index), depth+1, joinPath(path, p.key.s)); err != nil {
+			return err
+		}
 	}
-	var ok C.int
-	return float64(C.bridge_tonumber(s.l, C.int(idx), &ok)), nil
-}
-
-// stringAt copies the string at idx, which must be a string.
-func (s *State) stringAt(idx int) string {
-	var n C.size_t
-	p := C.bridge_tostring(s.l, C.int(idx), &n)
-	return C.GoStringN(p, C.int(n))
+	return nil
 }
 
 func floatToInt(f float64) (int64, bool) {

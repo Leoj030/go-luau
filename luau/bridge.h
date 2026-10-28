@@ -146,6 +146,32 @@ extern "C" {
     // Resumes a suspended thread by raising the error on top of its stack.
     int bridge_resumeerror(lua_State* co, lua_State* from);
 
+    // Type codes from bridge_typeof. Types not named here (vector, buffer, light
+    // userdata, ...) are BRIDGE_T_OTHER: ask bridge_typename for those.
+    enum {
+        BRIDGE_T_NONE = -1,   // not a valid stack index
+        BRIDGE_T_NIL = 0,
+        BRIDGE_T_BOOLEAN,
+        BRIDGE_T_NUMBER,
+        BRIDGE_T_STRING,
+        BRIDGE_T_TABLE,
+        BRIDGE_T_FUNCTION,
+        BRIDGE_T_USERDATA,
+        BRIDGE_T_THREAD,
+        BRIDGE_T_OTHER
+    };
+    int bridge_typeof(lua_State* L, int idx);
+    int bridge_pop(lua_State* L, int n);
+
+    // 0 ok, 1 bad index or layout, 2 not a table, 3 failed (frozen, out of memory), 4 stack full
+    int bridge_getfield(lua_State* L, int idx, const char* key, size_t klen);
+    int bridge_setfield(lua_State* L, int idx, const char* key, size_t klen);
+
+    // Whole values in one call. The wire format is described in bridge.cpp.
+    enum { BRIDGE_ENC_OK = 0, BRIDGE_ENC_BADINDEX = 1, BRIDGE_ENC_STACK = 2, BRIDGE_ENC_MEMORY = 3 };
+    int bridge_encode(lua_State* L, int idx, int maxdepth, const char** data, size_t* len);
+    int bridge_pushencoded(lua_State* L, const char* data, size_t len);
+
     #ifdef __cplusplus
 }
 
