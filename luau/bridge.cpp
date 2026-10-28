@@ -564,6 +564,13 @@ extern "C" {
         }
     }
 
+    int bridge_resetthread(lua_State* main, lua_State* co) {
+        int st = lua_costatus(main, co);
+        if (st == LUA_CORUN || st == LUA_CONOR) return -1;   // running, or waiting for a thread it resumed
+        lua_resetthread(co);
+        return 0;
+    }
+
     int bridge_resume(lua_State* co, lua_State* from, int narg) {
         try {
             return lua_resume(co, from, narg);

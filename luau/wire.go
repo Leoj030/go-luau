@@ -318,35 +318,38 @@ func (n *node) toAny() (any, error) {
 	return classify(entries), nil
 }
 
+// wireReader reads the wire format from a string, so the strings it hands
+// out are slices of it and nothing is copied for each one.
 type wireReader struct {
-	b   []byte
+	s   string
 	pos int
 }
 
 func (r *wireReader) u32() (int, bool) {
-	if len(r.b)-r.pos < 4 {
+	if len(r.s)-r.pos < 4 {
 		return 0, false
 	}
-	v := binary.LittleEndian.Uint32(r.b[r.pos:])
+	p := r.s[r.pos:]
+	v := uint32(p[0]) | uint32(p[1])<<8 | uint32(p[2])<<16 | uint32(p[3])<<24
 	r.pos += 4
 	return int(v), true
 }
 
 func (r *wireReader) bytes() (string, bool) {
 	n, ok := r.u32()
-	if !ok || len(r.b)-r.pos < n {
+	if !ok || len(r.s)-r.pos < n {
 		return "", false
 	}
-	s := string(r.b[r.pos : r.pos+n])
+	out := r.s[r.pos : r.pos+n]
 	r.pos += n
-	return s, true
+	return out, true
 }
 
 func (r *wireReader) node() (node, bool) {
-	if r.pos >= len(r.b) {
+	if r.pos >= len(r.s) {
 		return node{}, false
 	}
-	tag := r.b[r.pos]
+	tag := r.s[r.pos]
 	r.pos++
 	switch tag {
 	case wNil:
@@ -356,12 +359,14 @@ func (r *wireReader) node() (node, bool) {
 	case wTrue:
 		return node{kind: nBool, b: true}, true
 	case wNum:
-		if len(r.b)-r.pos < 8 {
+		if len(r.s)-r.pos < 8 {
 			return node{}, false
 		}
-		f := math.Float64frombits(binary.LittleEndian.Uint64(r.b[r.pos:]))
+		p := r.s[r.pos:]
+		bits := uint64(p[0]) | uint64(p[1])<<8 | uint64(p[2])<<16 | uint64(p[3])<<24 |
+			uint64(p[4])<<32 | uint64(p[5])<<40 | uint64(p[6])<<48 | uint64(p[7])<<56
 		r.pos += 8
-		return node{kind: nNum, n: f}, true
+		return node{kind: nNum, n: math.Float64frombits(bits)}, true
 	case wStr:
 		s, ok := r.bytes()
 		return node{kind: nStr, s: s}, ok
@@ -372,7 +377,7 @@ func (r *wireReader) node() (node, bool) {
 		return node{kind: nDeep}, true
 	case wMap:
 		n, ok := r.u32()
-		if !ok || n > len(r.b)-r.pos {
+		if !ok || n > len(r.s)-r.pos {
 			return node{}, false
 		}
 		out := node{kind: nTable, pairs: make([]pair, 0, n)}
@@ -392,10 +397,10 @@ func (r *wireReader) node() (node, bool) {
 	return node{}, false
 }
 
-func parseWire(b []byte) (node, error) {
-	r := wireReader{b: b}
+func parseWire(s string) (node, error) {
+	r := wireReader{s: s}
 	n, ok := r.node()
-	if !ok || r.pos != len(b) {
+	if !ok || r.pos != len(s) {
 		return node{}, errMalformed
 	}
 	return n, nil
@@ -422,13 +427,15 @@ func (s *State) readNode(idx, depth int) (node, error) {
 	if err != nil {
 		return node{}, err
 	}
-	return parseWire(raw)
+	// One copy. Every string in the result is a slice of it, so a decoded
+	// string keeps this whole buffer alive for as long as it lives.
+	return parseWire(string(raw))
 }
 
 // A Snapshot is a copy of a Lua value that no longer depends on the State it
 // came from: it can be read after the State is closed, and from any
 // goroutine. Take one with State.Snapshot.
-type Snapshot struct{ b []byte }
+type Snapshot struct{ s string }
 
 // Snapshot copies the value at idx, which can be anything Get reads, tables
 // included, in a single cgo call. Functions and the like inside a table are
@@ -436,7 +443,8 @@ type Snapshot struct{ b []byte }
 // pop the value.
 //
 // Reading the copy (Decode, Any) is plain Go with no cgo calls, so it can
-// happen on another goroutine, away from the one that owns the State.
+// happen on another goroutine, away from the one that owns the State. Strings
+// decoded from a Snapshot are slices of it, so they keep it alive.
 func (s *State) Snapshot(idx int) (*Snapshot, error) {
 	if !s.open() {
 		return nil, ErrClosed
@@ -445,16 +453,16 @@ func (s *State) Snapshot(idx int) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{b: append([]byte(nil), raw...)}, nil
+	return &Snapshot{s: string(raw)}, nil
 }
 
 // Kind returns the Lua type name of the value: "string", "table", "number"
 // and so on.
 func (sn *Snapshot) Kind() string {
-	if len(sn.b) == 0 {
+	if len(sn.s) == 0 {
 		return "no value"
 	}
-	switch sn.b[0] {
+	switch sn.s[0] {
 	case wNil:
 		return "nil"
 	case wFalse, wTrue:
@@ -464,8 +472,8 @@ func (sn *Snapshot) Kind() string {
 	case wStr:
 		return "string"
 	case wBad:
-		if n, ok := (&wireReader{b: sn.b, pos: 1}).bytes(); ok {
-			return n
+		if name, ok := (&wireReader{s: sn.s, pos: 1}).bytes(); ok {
+			return name
 		}
 	}
 	return "table"
@@ -477,16 +485,16 @@ func (sn *Snapshot) Decode(v any) error {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return fmt.Errorf("luau: Decode needs a non-nil pointer, got %T", v)
 	}
-	n, err := parseWire(sn.b)
+	n, err := parseWire(sn.s)
 	if err != nil {
 		return err
 	}
-	return assign(&n, rv.Elem(), 0, "")
+	return assign(&n, rv.Elem(), 0, nil)
 }
 
 // Any converts the value the way State.Get does.
 func (sn *Snapshot) Any() (any, error) {
-	n, err := parseWire(sn.b)
+	n, err := parseWire(sn.s)
 	if err != nil {
 		return nil, err
 	}

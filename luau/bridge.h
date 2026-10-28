@@ -132,6 +132,9 @@ extern "C" {
     // success, 1 if L is the main thread (nothing is pinned), -1 on failure.
     int bridge_pinthread(lua_State* L, int* ref);
 
+    // Returns a thread to the state of a new one. Fails (-1) for a thread that is running.
+    int bridge_resetthread(lua_State* main, lua_State* co);
+    
     int bridge_clearrequirecache(lua_State* L);
     int bridge_clearrequirecacheentry(lua_State* L, const char* key, size_t len);
 

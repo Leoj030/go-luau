@@ -330,3 +330,20 @@ func (s *State) Thread() (*Thread, error) {
 		started: true, // it is already running, so Resume continues it
 	}, nil
 }
+
+// Reset returns the thread to the state of a new one, so a chunk can be
+// loaded onto it and resumed again. It works on a thread that finished,
+// failed or is suspended (a suspended one is abandoned), and drops
+// everything on its stack. Reusing a thread this way is cheaper than closing
+// it and creating another, so it is the way to run many short tasks. It
+// fails for a thread that is running.
+func (t *Thread) Reset() error {
+	if !t.State.open() {
+		return ErrClosed
+	}
+	if C.bridge_resetthread(t.main.l, t.State.l) != 0 {
+		return errors.New("luau: cannot reset a thread that is running")
+	}
+	t.started = false
+	return nil
+}
