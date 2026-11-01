@@ -45,6 +45,7 @@ type VM struct {
 	cur   *luau.State // where operations run: s, or the call view while a Go function runs
 	depth int         // how many Go functions are running; 0 means we aren't inside one
 	fsys  fs.FS       // set by EnableRequire, and used by DoFile
+	types typeRegistry // Go types registered with RegisterType
 }
 
 // Option configures New.

@@ -26,7 +26,7 @@ func (v *VM) push(s *luau.State, name string, x any) error {
 }
 
 // pushAny pushes x, adding what luau.State.Push can't do: Go functions, Values,
-// and maps and slices that contain them.
+// registered types, and maps and slices that contain them.
 func (v *VM) pushAny(s *luau.State, name string, x any) error {
 	if name == "" {
 		name = "go"
@@ -44,9 +44,28 @@ func (v *VM) pushAny(s *luau.State, name string, x any) error {
 		return s.PushFunction(name, v.enterFunc(t))
 	case func(*luau.State) (int, error):
 		return s.PushFunction(name, v.enterFunc(luau.Func(t)))
+	case Frozen:
+		if err := v.pushMap(s, reflect.ValueOf(map[string]any(t))); err != nil {
+			return err
+		}
+		return s.Freeze(-1)
 	}
 
 	rv := reflect.ValueOf(x)
+	if rv.IsValid() {
+		if ut := v.types[rv.Type()]; ut != nil {
+			return v.pushUserdata(s, ut, x)
+		}
+		if rv.Kind() == reflect.Pointer {
+			if rv.IsNil() {
+				return s.Push(nil)
+			}
+			if ut := v.types[rv.Type().Elem()]; ut != nil {
+				return v.pushUserdata(s, ut, rv.Elem().Interface())
+			}
+		}
+	}
+
 	switch rv.Kind() {
 	case reflect.Func:
 		f, err := v.wrapFunc(name, x)
@@ -146,12 +165,18 @@ func (v *VM) wrapFunc(name string, fn any) (luau.Func, error) {
 		if variadic && i == numIn-1 {
 			pt = pt.Elem()
 		}
-		if err := checkType(pt, true, map[reflect.Type]bool{}); err != nil {
+		if v.direct(pt) {
+			continue
+		}
+		if err := v.checkType(pt, true, map[reflect.Type]bool{}); err != nil {
 			return nil, fmt.Errorf("vm: %s: parameter %d: %w", name, i+1, err)
 		}
 	}
 	for i := 0; i < valueOuts; i++ {
-		if err := checkType(t.Out(i), false, map[reflect.Type]bool{}); err != nil {
+		if v.direct(t.Out(i)) {
+			continue
+		}
+		if err := v.checkType(t.Out(i), false, map[reflect.Type]bool{}); err != nil {
 			return nil, fmt.Errorf("vm: %s: result %d: %w", name, i+1, err)
 		}
 	}
@@ -229,6 +254,26 @@ func (v *VM) argument(c *luau.State, fname string, idx, argc int, typ reflect.Ty
 		}
 		*temps = append(*temps, x)
 		return reflect.ValueOf(x), nil
+	}
+
+	// A registered type arrives as userdata.
+	if ut := v.types[typ]; ut != nil {
+		return v.userdataArg(c, fname, idx, missing, ut)
+	}
+	// A pointer to a registered type is optional.
+	if typ.Kind() == reflect.Pointer {
+		if ut := v.types[typ.Elem()]; ut != nil {
+			if missing || c.TypeName(idx) == "nil" {
+				return reflect.Zero(typ), nil
+			}
+			rv, err := v.userdataArg(c, fname, idx, false, ut)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			p := reflect.New(ut.typ)
+			p.Elem().Set(rv)
+			return p, nil
+		}
 	}
 
 	// Pointers and any are optional: a missing or nil argument leaves them nil.
@@ -310,9 +355,11 @@ func cleanDecodeError(err error) string {
 // checkType reports why a Go type can't be converted to or from a Lua value,
 // or nil if it can. param is true for a parameter, which has to be filled
 // from a Lua value, and false for a result, which only has to be pushed.
-func checkType(t reflect.Type, param bool, seen map[reflect.Type]bool) error {
-	if t == valueType {
-		return nil
+// Direct parameters and results are checked by the caller, so a *Value or a
+// registered type met here is nested inside something else.
+func (v *VM) checkType(t reflect.Type, param bool, seen map[reflect.Type]bool) error {
+	if v.direct(t) {
+		return errors.New("a *vm.Value or a registered type can only be a direct parameter or result, not part of a struct, slice or map")
 	}
 	if seen[t] {
 		return nil // a type that refers to itself, such as a linked list
@@ -331,7 +378,7 @@ func checkType(t reflect.Type, param bool, seen map[reflect.Type]bool) error {
 		}
 		return nil
 	case reflect.Pointer, reflect.Slice, reflect.Array:
-		return checkType(t.Elem(), param, seen)
+		return v.checkType(t.Elem(), param, seen)
 	case reflect.Map:
 		switch t.Key().Kind() {
 		case reflect.String, reflect.Bool, reflect.Interface,
@@ -341,14 +388,14 @@ func checkType(t reflect.Type, param bool, seen map[reflect.Type]bool) error {
 		default:
 			return fmt.Errorf("%s has keys that a Lua table can't have (use strings, numbers or booleans)", t)
 		}
-		return checkType(t.Elem(), param, seen)
+		return v.checkType(t.Elem(), param, seen)
 	case reflect.Struct:
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
 			if !f.IsExported() || f.Tag.Get("luau") == "-" {
 				continue
 			}
-			if err := checkType(f.Type, param, seen); err != nil {
+			if err := v.checkType(f.Type, param, seen); err != nil {
 				return fmt.Errorf("field %s: %w", f.Name, err)
 			}
 		}
