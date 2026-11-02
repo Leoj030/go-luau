@@ -715,4 +715,12 @@ extern "C" {
             return -1;
         }
     }
+
+    int bridge_remove(lua_State* L, int idx) {
+        int top = lua_gettop(L);
+        if (idx < 0) idx = top + idx + 1;
+        if (idx < 1 || idx > top) return -1;
+        lua_remove(L, idx);
+        return 0;
+    }
 }

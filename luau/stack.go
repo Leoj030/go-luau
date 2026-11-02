@@ -85,6 +85,18 @@ func (s *State) Pop(n int) error {
 	return nil
 }
 
+// Remove removes the value at idx and shifts the values above it down, so
+// the stack is one value shorter.
+func (s *State) Remove(idx int) error {
+	if !s.open() {
+		return ErrClosed
+	}
+	if C.bridge_remove(s.l, C.int(idx)) != 0 {
+		return fmt.Errorf("luau: stack index %d is not valid", idx)
+	}
+	return nil
+}
+
 // Push converts a Go value to its Luau equivalent and pushes it on the
 // stack. Strings are copied into Luau, so the Go string can be freed or
 // modified afterwards.

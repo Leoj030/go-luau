@@ -134,21 +134,114 @@ func (v *VM) Get(name string) (*Value, error) {
 }
 
 // Module registers members as the module that require(path) returns. The
-// path starts with "@", such as "@std/json". Members can be Go functions,
-// numbers, strings, nested maps and anything else Set accepts, and the
-// module table is frozen. A registered module wins over a file with the
-// same path.
+// path starts with "@", such as "@std/json". Members can be Go functions
+// (typed ones, or low-level func(*luau.State) (int, error)), numbers,
+// strings, slices, nested maps and anything else Set accepts, and the module
+// table is frozen. A registered module wins over a file with the same path.
+// Use Frozen for nested tables that should be read-only too.
+//
+// A key that starts with "__" is not a member but a metamethod of the module
+// table. "__call" makes the module itself callable: with
+//
+//	"__call": serve
+//
+// a script can write require(path)(a, b), and serve receives a and b, without
+// the module table that Luau passes first. "__tostring" and the other
+// metamethods work the same way. __index, __newindex and __metatable can't be
+// set. The metatable is locked.
 func (v *VM) Module(path string, members map[string]any) error {
+	plain := make(map[string]any, len(members))
+	var meta map[string]any
+	for name, member := range members {
+		if strings.HasPrefix(name, "__") {
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			meta[name] = member
+			continue
+		}
+		plain[name] = member
+	}
+
 	s := v.cur
 	base := s.Top()
-	if err := v.push(s, path, members); err != nil {
-		return err
-	}
-	if err := s.RegisterModuleTable(path); err != nil {
+	fail := func(err error) error {
 		s.Pop(s.Top() - base)
 		return err
 	}
+	if err := v.push(s, path, plain); err != nil {
+		return fail(err)
+	}
+	if len(meta) > 0 {
+		if err := v.pushModuleMeta(s, path, meta); err != nil {
+			return fail(err)
+		}
+		if err := s.SetMetatable(-2); err != nil {
+			return fail(err)
+		}
+	}
+	if err := s.RegisterModuleTable(path); err != nil {
+		return fail(err)
+	}
 	return nil
+}
+
+// pushModuleMeta pushes the metatable of a module, built from its "__" keys.
+func (v *VM) pushModuleMeta(s *luau.State, path string, meta map[string]any) error {
+	if err := s.NewTable(0, len(meta)+1); err != nil {
+		return err
+	}
+	for name, member := range meta {
+		switch name {
+		case "__index", "__newindex", "__metatable":
+			return fmt.Errorf("vm: module %s: %s can't be set", path, name)
+		}
+		if name == "__call" {
+			fn, err := v.callMember(path, member)
+			if err != nil {
+				return fmt.Errorf("vm: module %s: __call: %w", path, err)
+			}
+			member = fn
+		}
+		if err := v.push(s, name, member); err != nil {
+			return fmt.Errorf("vm: module %s: %s: %w", path, name, err)
+		}
+		if err := s.SetField(-2, name); err != nil {
+			return err
+		}
+	}
+	if err := s.Push(lockedMessage); err != nil {
+		return err
+	}
+	return s.SetField(-2, "__metatable")
+}
+
+// callMember turns the function behind a module's __call into one that
+// doesn't see the module table, which Luau passes as the first argument.
+func (v *VM) callMember(path string, member any) (luau.Func, error) {
+	var inner luau.Func
+	switch f := member.(type) {
+	case luau.Func:
+		inner = v.enterFunc(f)
+	case func(*luau.State) (int, error):
+		inner = v.enterFunc(luau.Func(f))
+	default:
+		name := path
+		if i := strings.LastIndexByte(path, '/'); i >= 0 {
+			name = path[i+1:]
+		}
+		wrapped, err := v.wrapFunc(name, member)
+		if err != nil {
+			return nil, err
+		}
+		inner = wrapped
+	}
+	return func(c *luau.State) (int, error) {
+		if err := c.Remove(1); err != nil {
+			return 0, err
+		}
+		return inner(c)
+	}, nil
 }
 
 // Do runs Luau source and discards its results.

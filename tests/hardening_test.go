@@ -176,3 +176,28 @@ func TestPushFunctionRejectsNil(t *testing.T) {
 		t.Error("a nil function should be rejected")
 	}
 }
+
+func TestStateRemove(t *testing.T) {
+	L := newState(t)
+	L.Push("a")
+	L.Push("b")
+	L.Push("c")
+	if err := L.Remove(1); err != nil {
+		t.Fatal(err)
+	}
+	if L.Top() != 2 {
+		t.Fatalf("Top() = %d, want 2", L.Top())
+	}
+	if v, _ := L.Get(1); v != "b" {
+		t.Errorf("Get(1) = %v, want b", v)
+	}
+	if err := L.Remove(-1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := L.Get(-1); v != "b" {
+		t.Errorf("Get(-1) = %v, want b", v)
+	}
+	if L.Remove(5) == nil || L.Remove(0) == nil {
+		t.Error("an invalid index should fail")
+	}
+}

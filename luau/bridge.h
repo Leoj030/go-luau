@@ -175,6 +175,8 @@ extern "C" {
     int bridge_encode(lua_State* L, int idx, int maxdepth, const char** data, size_t* len);
     int bridge_pushencoded(lua_State* L, const char* data, size_t len);
 
+    int bridge_remove(lua_State* L, int idx);
+
     #ifdef __cplusplus
 }
 

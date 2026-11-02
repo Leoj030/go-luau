@@ -194,3 +194,13 @@ func (v *VM) direct(t reflect.Type) bool {
 	}
 	return t.Kind() == reflect.Pointer && v.types[t.Elem()] != nil
 }
+
+// MustRegisterType is RegisterType that panics on failure. A library's
+// constructor can use it, because registration only fails through a mistake
+// in the program (registering twice, or a bad spec), not through anything a
+// script does.
+func MustRegisterType[T any](v *VM, spec TypeSpec) {
+	if err := RegisterType[T](v, spec); err != nil {
+		panic(err)
+	}
+}

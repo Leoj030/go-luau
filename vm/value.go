@@ -188,3 +188,13 @@ func (x *Value) CallContext(ctx context.Context, args ...any) ([]*Value, error) 
 	}
 	return v.run(ctx, th, len(args))
 }
+
+// Ref returns the low-level reference behind the value, for functions in
+// package luau that take one. It is valid until the Value is released, so
+// Retain a value that came in as an argument first.
+func (x *Value) Ref() luau.Ref {
+	if x == nil {
+		return 0
+	}
+	return x.ref
+}

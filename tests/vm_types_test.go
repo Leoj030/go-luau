@@ -7,11 +7,88 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/Leoj030/go-luau/luau"
 	"github.com/Leoj030/go-luau/vm"
 )
 
 type vec struct{ x, y float64 }
 type other struct{ n int }
+type handle struct{ finalized *int }
+
+func (h *handle) Finalize() { *h.finalized++ }
+
+func TestVMCallableModule(t *testing.T) {
+	v := newVM(t)
+	if err := v.EnableRequire(fstest.MapFS{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Module("@t/call", map[string]any{
+		"__call": func(a, b float64) float64 { return a + b },
+		"add":    func(a, b float64) float64 { return a + b },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Module("@t/low", map[string]any{
+		// a low-level __call reports how many arguments it got: the module table is not one of them
+		"__call": func(c *luau.State) (int, error) { return 1, c.Push(c.Top()) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Do(`
+		local m = require("@t/call")
+		r1 = m(2, 3)
+		r2 = m.add(2, 3)
+		r3 = require("@t/low")("a", "b")
+		meta = getmetatable(m)`); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]any{"r1": 5.0, "r2": 5.0, "r3": 2.0, "meta": "The metatable is locked!"} {
+		if got := vmGlobal(t, v, name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+
+	err := v.Do(`require("@t/call")("x", 3)`)
+	if err == nil || !strings.Contains(err.Error(), "invalid argument #1 to 'call' (number expected, got string)") {
+		t.Errorf("got %v, want a typed argument error without the module table counted", err)
+	}
+	if err := v.Do(`require("@t/call").extra = 1`); err == nil {
+		t.Error("the module table should be read-only")
+	}
+	if err := v.Module("@t/bad", map[string]any{"__index": func() {}}); err == nil {
+		t.Error("__index can't be set on a module")
+	}
+}
+
+func TestVMPointerTypesFinalizeAndKeepMethods(t *testing.T) {
+	v := newVM(t)
+	finalized, closed := 0, 0
+	vm.MustRegisterType[*handle](v, vm.TypeSpec{
+		Name:    "Handle",
+		Methods: map[string]any{"close": func(h *handle) { closed++ }},
+	})
+	v.Set("open", func() *handle { return &handle{&finalized} })
+
+	if err := v.Do(`local h = open() h:close() h:close()`); err != nil {
+		t.Fatal(err)
+	}
+	v.GC()
+	v.GC()
+	if closed != 2 || finalized != 1 {
+		t.Errorf("closed %d times and finalized %d times, want 2 and 1", closed, finalized)
+	}
+}
+
+func TestVMMustRegisterTypePanicsOnMistakes(t *testing.T) {
+	v := newVM(t)
+	vm.MustRegisterType[vec](v, vm.TypeSpec{Name: "Vec"})
+	defer func() {
+		if recover() == nil {
+			t.Error("registering twice should panic")
+		}
+	}()
+	vm.MustRegisterType[vec](v, vm.TypeSpec{Name: "Vec"})
+}
 
 func newVecVM(t *testing.T) *vm.VM {
 	t.Helper()
