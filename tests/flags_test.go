@@ -7,7 +7,7 @@ import (
 )
 
 func TestClassWhenEnabled(t *testing.T) {
-	flags := []string{ "DebugLuauUserDefinedClasses", "DebugLuauUserDefinedClassesRuntime" }
+	flags := []string{"DebugLuauUserDefinedClasses", "DebugLuauUserDefinedClassesRuntime"}
 
 	for _, flag := range flags {
 		if _, exists := luau.FastFlag(flag); !exists {
