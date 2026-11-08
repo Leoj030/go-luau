@@ -4,6 +4,7 @@
 #include <string>
 #include <string.h>
 
+#include "Luau/Common.h"
 #include "Luau/Allocator.h"
 #include "Luau/Lexer.h"
 #include "Luau/Parser.h"
@@ -722,5 +723,22 @@ extern "C" {
         if (idx < 1 || idx > top) return -1;
         lua_remove(L, idx);
         return 0;
+    }
+
+    int bridge_setfastflag(const char* name, int enabled) {
+        for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next) {
+            if (strcmp(flag->name, name) == 0) {
+                flag->value = enabled != 0;
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    int bridge_getfastflag(const char* name) {
+        for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next) {
+            if (strcmp(flag->name, name) == 0) return flag->value ? 1 : 0;
+        }
+        return -1;
     }
 }

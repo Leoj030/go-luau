@@ -177,6 +177,12 @@ extern "C" {
 
     int bridge_remove(lua_State* L, int idx);
 
+    // Luau's fast flags are global to the process.
+    // bridge_setfastflag returns 1 if a flag with that name exists (and was set), else 0.
+    int bridge_setfastflag(const char* name, int enabled);
+    // Returns 1 or 0 for the flag's value, or -1 if there is no such flag.
+    int bridge_getfastflag(const char* name);
+
     #ifdef __cplusplus
 }
 
