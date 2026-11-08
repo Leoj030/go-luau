@@ -22,6 +22,11 @@ vet:
 fmt:
 	gofmt -l -w luau tests examples
 
+update-luau:
+	git submodule update --init
+	git -C third_party/luau fetch --tags
+	git -C third_party/luau checkout $(ARGS)
+
 # Re-copy Luau sources from the submodule (only after updating it)
 sync:
 	sh sync-luau.sh

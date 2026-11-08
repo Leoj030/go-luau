@@ -6,7 +6,6 @@ DST=luau/core
 mkdir -p $DST
 rm -f $DST/*.cpp $DST/*.h
 
-find luau -maxdepth 1 \( -name '*.cpp' -o -name '*.h' \) ! -name 'bridge.*' -delete
 rm -rf luau/include && mkdir -p luau/include
 
 find $SRC/VM/src $SRC/Common/src $SRC/Bytecode/src $SRC/Ast/src $SRC/Compiler/src $SRC/Config/src $SRC/Require/src \
