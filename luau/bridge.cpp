@@ -741,4 +741,20 @@ extern "C" {
         }
         return -1;
     }
+
+    int bridge_fastflagcount(void) {
+        int n = 0;
+        for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next) n++;
+        return n;
+    }
+
+    const char* bridge_fastflagat(int i, int* value) {
+        for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next) {
+            if (i-- == 0) {
+                *value = flag->value ? 1 : 0;
+                return flag->name;
+            }
+        }
+        return nullptr;
+    }
 }

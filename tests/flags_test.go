@@ -6,32 +6,24 @@ import (
 	"github.com/Leoj030/go-luau/luau"
 )
 
-func TestClassWhenEnabled(t *testing.T) {
-	flags := []string{"DebugLuauUserDefinedClasses", "DebugLuauUserDefinedClassesRuntime"}
-
+func setFlags(t *testing.T, flags []string, b bool) {
+	t.Helper()
 	for _, flag := range flags {
 		if _, exists := luau.FastFlag(flag); !exists {
 			t.Skip("this Luau version has no " + flag)
 		}
-	}
-	if err := luau.SetFastFlag(flags[0], true); err != nil {
-		t.Fatal(err)
-	}
-	if err := luau.SetFastFlag(flags[1], true); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		for _, flag := range flags {
-			luau.SetFastFlag(flag, false)
+		if err := luau.SetFastFlag(flag, b); err != nil {
+			t.Fatal(err)
 		}
-	})
-
-	L, err := luau.NewState()
-	if err != nil {
-		panic(err)
 	}
-	defer L.Close()
+}
 
+func TestClassSyntax(t *testing.T) {
+	flags := []string{"DebugLuauUserDefinedClasses", "DebugLuauUserDefinedClassesRuntime"}
+	setFlags(t, flags, true)
+	t.Cleanup(func() { setFlags(t, flags, false) })
+
+	L := newState(t)
 	if err := L.DoString(`
 		class Point
 			public x: number
@@ -54,5 +46,45 @@ func TestClassWhenEnabled(t *testing.T) {
 		print("Check out my cool point: " .. tostring(p) .. "  length = " .. tostring(p:length()))
 	`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalConditionSyntax(t *testing.T) {
+	flags := []string{"LuauExperimentalIfLocalSyntax", "LuauExperimentalWhileLocalSyntax"}
+	setFlags(t, flags, true)
+	t.Cleanup(func() { setFlags(t, flags, false) })
+
+	L := newState(t)
+	err := L.DoString(`
+		local queue = {3, 2, 1}
+		local total = 0
+		while local item = table.remove(queue) do
+			total += item
+		end
+		whileresult = total
+
+		if local n = tonumber("42") then
+			ifresult = n * 2
+		end
+
+		if local a = tonumber("x") then
+			elseresult = -1
+		elseif local b = tonumber("7") then
+			elseresult = b
+		end
+
+		leaked = n`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]any{
+		"whileresult": 6.0,
+		"ifresult":    84.0,
+		"elseresult":  7.0,
+		"leaked":      nil,
+	} {
+		if got, _ := L.GetGlobal(name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
 	}
 }

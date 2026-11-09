@@ -183,6 +183,10 @@ extern "C" {
     // Returns 1 or 0 for the flag's value, or -1 if there is no such flag.
     int bridge_getfastflag(const char* name);
 
+    // The number of fast flags in this build, and the name and value of the i-th.
+    int bridge_fastflagcount(void);
+    const char* bridge_fastflagat(int i, int* value);
+
     #ifdef __cplusplus
 }
 

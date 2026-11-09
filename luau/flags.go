@@ -47,3 +47,18 @@ func FastFlag(name string) (enabled, exists bool) {
 	}
 	return false, false
 }
+
+// FastFlags returns every fast flag in this build with its current value.
+// Use it to find out which flags exist, for example before turning on an
+// experimental feature.
+func FastFlags() map[string]bool {
+	n := int(C.bridge_fastflagcount())
+	out := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		var on C.int
+		if name := C.bridge_fastflagat(C.int(i), &on); name != nil {
+			out[C.GoString(name)] = on != 0
+		}
+	}
+	return out
+}
